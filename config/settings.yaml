@@ -1,0 +1,25 @@
+paths:
+  input_dir: data/input
+  samples_dir: data/samples
+  output_dir: data/output
+  conflicts_dir: data/conflicts
+  state_dir: data/state
+  logs_dir: data/logs
+
+excel:
+  header_row: 1
+  sheet_name: null
+  use_active_sheet_when_sheet_not_set: true
+
+sampling:
+  default_sample_size: 50
+  default_seed: null
+
+logging:
+  level: INFO
+
+llm_reserved:
+  interface: openai_compatible
+  max_concurrency: 4
+  max_retries: 3
+  timeout_seconds: 60
