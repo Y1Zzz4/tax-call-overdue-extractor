@@ -33,7 +33,7 @@ class SamplingResult:
 
 
 def is_valid_call_text(value: object) -> bool:
-    """判断“电话录音转文本内容”是否满足本轮抽样有效条件。"""
+    """判断“语音转文本”是否满足本轮抽样有效条件。"""
 
     if value is None:
         return False

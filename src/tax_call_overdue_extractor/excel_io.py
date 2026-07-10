@@ -30,7 +30,7 @@ EXPECTED_COLUMNS: tuple[str, ...] = (
     "业务编号",
     "来电号码",
     "登记人姓名",
-    "电话录音转文本内容",
+    "语音转文本",
     "小结类型",
     "登记人部门名称",
     "登记日期",
@@ -43,7 +43,7 @@ EXPECTED_COLUMNS: tuple[str, ...] = (
     "涉及金额",
     "是否确定已逾期",
 )
-CALL_TEXT_COLUMN = "电话录音转文本内容"
+CALL_TEXT_COLUMN = "语音转文本"
 
 
 @dataclass(frozen=True)
@@ -216,7 +216,7 @@ def validate_sample_output(
         for offset, source_row in enumerate(selected_rows, start=1):
             output_row = header_row + offset
             if not is_valid_call_text(output_sheet.cell(row=output_row, column=text_column).value):
-                raise OutputValidationError("输出文件包含无效的电话录音转文本内容")
+                raise OutputValidationError("输出文件包含无效的语音转文本内容")
             for column in range(1, len(EXPECTED_COLUMNS) + 1):
                 source_cell = source_sheet.cell(row=source_row, column=column)
                 output_cell = output_sheet.cell(row=output_row, column=column)
