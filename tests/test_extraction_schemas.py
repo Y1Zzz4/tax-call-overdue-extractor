@@ -117,3 +117,34 @@ def test_irrelevant_result_cannot_contain_items() -> None:
 
     with pytest.raises(ValidationError):
         ExtractionResult.model_validate(payload)
+
+
+def test_relevant_result_must_contain_at_least_one_item() -> None:
+    payload = valid_result_payload()
+    payload["items"] = []
+
+    with pytest.raises(ValidationError):
+        ExtractionResult.model_validate(payload)
+
+
+def test_empty_item_without_target_information_is_rejected() -> None:
+    payload = valid_result_payload()
+    payload["items"] = [
+        {
+            "enterprise_name": None,
+            "enterprise_evidence": [],
+            "tax_types": [],
+            "tax_type_raw": [],
+            "tax_evidence": [],
+            "periods": [],
+            "amounts": [],
+            "explicitly_overdue": None,
+            "overdue_evidence": [],
+            "relationship_note": None,
+            "needs_review": False,
+            "review_reasons": [],
+        }
+    ]
+
+    with pytest.raises(ValidationError):
+        ExtractionResult.model_validate(payload)

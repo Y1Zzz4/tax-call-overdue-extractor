@@ -213,6 +213,8 @@ data/state/preview/row_<row-number>.json
 
 `ExtractionResult` 包含 `schema_version`、`has_relevant_information`、`items`、`conflicts`、`needs_review`、`review_reasons`。模型输出必须符合 Schema，非法 JSON、非法税种、非法 evidence source、非法月份等都会被拒绝。
 
+相关信息不要求原文已经明确逾期。只要三列中出现企业名称、明确企业简称、税种、所属期、涉税金额或明确期限状态中的任意一项，就应当返回 `has_relevant_information=true` 并至少生成一个 item。若只识别出企业名称，也允许 `tax_types`、`periods`、`amounts` 为空；是否逾期会在后续结合本地月份数据判断。
+
 ## Excel 格式保留说明
 
 抽样不会用 pandas 重建工作簿。实现方式是先复制原始 `.xlsx` 到临时文件，再从下到上删除未抽中的数据行，随后更新自动筛选和 Excel 表格对象范围，保存并重新读取验证，最后原子移动到最终输出路径。

@@ -127,6 +127,23 @@ class ExtractionItem(StrictSchemaModel):
                 deduped.append(value)
         return deduped
 
+    @model_validator(mode="after")
+    def item_must_contain_target_information(self) -> "ExtractionItem":
+        has_target = any(
+            [
+                self.enterprise_name is not None,
+                bool(self.tax_types),
+                bool(self.tax_type_raw),
+                bool(self.periods),
+                bool(self.amounts),
+                self.explicitly_overdue is not None,
+                bool(self.overdue_evidence),
+            ]
+        )
+        if not has_target:
+            raise ValueError("ExtractionItem 至少需要包含一个目标字段")
+        return self
+
 
 class ConflictClaim(StrictSchemaModel):
     source: SourceName
@@ -159,6 +176,8 @@ class ExtractionResult(StrictSchemaModel):
     def no_items_when_irrelevant(self) -> "ExtractionResult":
         if not self.has_relevant_information and self.items:
             raise ValueError("has_relevant_information 为 false 时不应包含 items")
+        if self.has_relevant_information and not self.items:
+            raise ValueError("has_relevant_information 为 true 时必须包含至少一个 item")
         return self
 
 

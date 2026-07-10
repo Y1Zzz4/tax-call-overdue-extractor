@@ -127,7 +127,8 @@ def _print_dry_run_summary(summary) -> None:
     print(f"dry_run=True")
     print(f"row_number={summary.row_number}")
     for field in summary.field_summaries:
-        print(f"field={field.name} empty={field.is_empty} char_count={field.char_count}")
+        status = "空" if field.is_empty else "有效"
+        print(f"{field.name}：{status}，字符数={field.char_count}")
     print(f"total_char_count={summary.total_chars}")
     print(f"request_sha256={summary.request_sha256}")
     print(f"model={summary.model}")

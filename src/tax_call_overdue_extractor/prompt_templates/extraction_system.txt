@@ -4,6 +4,16 @@
 
 只提取文本明确表达或可以通过多个来源可靠纠正的信息。不得根据一般税法知识虚构企业名称、税种、所属期、金额或逾期状态。
 
+本任务既提取信息，也为后续本地逾期判断提供原始事实。原文即使没有出现“逾期”二字，只要出现企业名称、明确企业简称、税种、所属期、涉及税务事项的金额、或明确逾期/欠税/未逾期/尚未到期等期限状态中的任意一项，都属于相关信息。是否逾期将在后续结合本地月份数据判断，不能把“没有明确逾期表述”当作无相关信息。
+
+has_relevant_information 的判断规则：
+- 只要三个来源中任一来源明确出现企业名称或明确企业简称，has_relevant_information 必须为 true，并至少生成一个 ExtractionItem。
+- 只要出现税种、所属期、涉及税务事项的金额、或明确期限状态，has_relevant_information 必须为 true，并至少生成一个 ExtractionItem。
+- 如果只识别出企业名称，也必须生成 item；此时允许 enterprise_name 为企业名称，tax_types、tax_type_raw、periods、amounts 为空列表，explicitly_overdue 为 null。
+- 如果只识别出税种、所属期、金额或期限状态，也必须生成 item；未知字段使用 null 或空列表，不得因为字段不完整删除 item。
+- item 不要求同时具备企业、税种、所属期和金额。
+- 只有三个来源中完全不存在任何目标信息时，才可以返回 has_relevant_information=false 且 items=[]。
+
 只能依据以下三个来源字段：
 - 电话录音转文本内容
 - 业务内容
@@ -37,12 +47,12 @@
 3. 互相补充的信息应合并。
 4. 无法同时成立的信息应记录到conflicts，不得自行选择。
 5. ASR同音字或明显错别字只有在其他文本能够佐证时才可以纠正。
-6. 企业代称不能作为企业名称。
+6. 企业代称不能作为企业名称；“我们公司”“我司”“本公司”“我们单位”等代称不得作为 enterprise_name。明确出现的企业简称可以原样提取。
 7. 税种必须映射到给定标准列表；必须使用“城市建设维护税”这个名称。
 8. 所属期必须保留原文表达。
 9. 相对所属期不得在缺少参考日期时转换为绝对年月。
 10. 金额尽量保持原文说法。
-11. 只提取与逾期税款、欠税、未按期申报缴纳等事项有关的金额。
+11. 金额只提取与税款、申报缴纳、欠税、逾期、滞纳金、罚款等税务事项有关的金额；不得把无关交易金额误认为涉税金额。提取金额不要求原文已经明确逾期。
 12. 明确说“已逾期”“已经产生逾期”“存在欠税”等内容时，explicitly_overdue为true。
 13. 明确说“未逾期”“尚未到期”时，explicitly_overdue为false。
 14. 没有明确表达时为null。
@@ -50,12 +60,41 @@
 16. 证据quote必须来自相应source，不得改写或编造。
 17. 无法可靠判断时使用null、空列表或needs_review，不得猜测。
 18. 最终只输出符合指定Schema的JSON，不要输出Markdown、解释、代码块或额外文字。
+19. periods 必须是 PeriodMention 对象数组，不能输出字符串数组。例如不能写 "periods": ["2026年2月"]。
+20. 每个 item 必须包含 needs_review 和 review_reasons。
+21. 不允许在 item 根级输出 evidence 字段；证据必须放入 enterprise_evidence、tax_evidence、periods[].evidence、amounts[].evidence 或 overdue_evidence。
 
 输出JSON顶层结构：
 {
   "schema_version": "1.0",
   "has_relevant_information": true,
-  "items": [],
+  "items": [
+    {
+      "enterprise_name": null,
+      "enterprise_evidence": [],
+      "tax_types": [],
+      "tax_type_raw": [],
+      "tax_evidence": [],
+      "periods": [
+        {
+          "raw_text": "原文所属期表达",
+          "period_type": "unparsed",
+          "start_year": null,
+          "start_month": null,
+          "end_year": null,
+          "end_month": null,
+          "relative_expression": null,
+          "evidence": []
+        }
+      ],
+      "amounts": [],
+      "explicitly_overdue": null,
+      "overdue_evidence": [],
+      "relationship_note": null,
+      "needs_review": false,
+      "review_reasons": []
+    }
+  ],
   "conflicts": [],
   "needs_review": false,
   "review_reasons": []
@@ -63,6 +102,10 @@
 
 边界示例：
 - 文本只说“我们公司上个月可能有税没缴”，企业名称应为null；所属期为relative；不要把“上个月”换算为绝对年月。
+- 文本只明确出现某个企业名称，没有税种、所属期、金额或逾期状态时，仍然属于相关信息，必须生成一个只含 enterprise_name 的 item。
+- 文本只出现“增值税”或“2025年第四季度”这类税种或所属期，也属于相关信息，未知字段保持 null 或空列表。
+- 文本出现企业名称和所属期但没有“逾期”二字时，仍然必须提取；explicitly_overdue 使用 null。
+- 文本只出现“我们公司”“我司”等代称，且没有其他目标信息时，不得虚构企业名称，可以返回无相关信息。
 - 文本提到“附加税费”但没有说明组成时，不要凭常识拆成多个具体税种。
 - 一个来源说已逾期，另一个来源明确说尚未到期，且无法同时成立时，应记录overdue冲突。
 - “三万多”“约2.5万元”应保留原始金额表达，不要自行换算或相加。

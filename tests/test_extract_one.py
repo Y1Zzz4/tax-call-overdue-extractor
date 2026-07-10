@@ -106,6 +106,49 @@ def success_json() -> str:
     )
 
 
+def enterprise_only_json(name: str = "甲测试企业") -> str:
+    return json.dumps(
+        {
+            "schema_version": "1.0",
+            "has_relevant_information": True,
+            "items": [
+                {
+                    "enterprise_name": name,
+                    "enterprise_evidence": [{"source": "业务内容", "quote": name}],
+                    "tax_types": [],
+                    "tax_type_raw": [],
+                    "tax_evidence": [],
+                    "periods": [],
+                    "amounts": [],
+                    "explicitly_overdue": None,
+                    "overdue_evidence": [],
+                    "relationship_note": None,
+                    "needs_review": False,
+                    "review_reasons": [],
+                }
+            ],
+            "conflicts": [],
+            "needs_review": False,
+            "review_reasons": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+def no_relevant_json() -> str:
+    return json.dumps(
+        {
+            "schema_version": "1.0",
+            "has_relevant_information": False,
+            "items": [],
+            "conflicts": [],
+            "needs_review": False,
+            "review_reasons": [],
+        },
+        ensure_ascii=False,
+    )
+
+
 class FakeLLMClient:
     def __init__(self, content: str = "") -> None:
         self.content = content or success_json()
@@ -148,6 +191,80 @@ def test_extract_one_success_with_mock_client(tmp_path: Path) -> None:
     data = json.loads(output.read_text(encoding="utf-8"))
     assert data["status"] == "success"
     assert data["result"]["items"][0]["tax_types"] == ["未识别"]
+
+
+def test_only_business_content_enterprise_is_extracted(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.samples_dir / "sample.xlsx"
+    output = settings.paths.state_dir / "preview" / "row_2.json"
+    create_workbook(source, row_with_texts(None, "甲测试企业", None))
+    client = FakeLLMClient(enterprise_only_json("甲测试企业"))
+
+    result = SingleRecordExtractionService(settings, llm_client=client).extract_one(
+        input_path=source,
+        row_number=2,
+        output_path=output,
+        sheet_name=None,
+        overwrite=False,
+    )
+
+    user_data = json.loads(client.last_request.messages[1]["content"])
+    assert user_data["电话录音转文本内容"] is None
+    assert user_data["业务内容"] == "甲测试企业"
+    assert user_data["答复内容"] is None
+    assert result.item_count == 1
+    data = json.loads(output.read_text(encoding="utf-8"))
+    item = data["result"]["items"][0]
+    assert data["result"]["has_relevant_information"] is True
+    assert item["enterprise_name"] == "甲测试企业"
+    assert item["tax_types"] == []
+    assert item["tax_type_raw"] == []
+    assert item["periods"] == []
+    assert item["amounts"] == []
+    assert item["explicitly_overdue"] is None
+
+
+def test_empty_voice_text_does_not_block_business_content_extraction(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.samples_dir / "sample.xlsx"
+    output = settings.paths.state_dir / "preview" / "row_2.json"
+    create_workbook(source, row_with_texts("   ", "乙测试企业", "#N/A"))
+    client = FakeLLMClient(enterprise_only_json("乙测试企业"))
+
+    result = SingleRecordExtractionService(settings, llm_client=client).extract_one(
+        input_path=source,
+        row_number=2,
+        output_path=output,
+        sheet_name=None,
+        overwrite=False,
+    )
+
+    user_data = json.loads(client.last_request.messages[1]["content"])
+    assert user_data["电话录音转文本内容"] is None
+    assert user_data["业务内容"] == "乙测试企业"
+    assert result.called_api is True
+    assert result.item_count == 1
+
+
+def test_pronoun_only_can_return_no_relevant_information(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.samples_dir / "sample.xlsx"
+    output = settings.paths.state_dir / "preview" / "row_2.json"
+    create_workbook(source, row_with_texts(None, "我们公司", None))
+    client = FakeLLMClient(no_relevant_json())
+
+    result = SingleRecordExtractionService(settings, llm_client=client).extract_one(
+        input_path=source,
+        row_number=2,
+        output_path=output,
+        sheet_name=None,
+        overwrite=False,
+    )
+
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert result.item_count == 0
+    assert data["result"]["has_relevant_information"] is False
+    assert data["result"]["items"] == []
 
 
 def test_one_allowed_field_can_be_empty_or_na(tmp_path: Path) -> None:

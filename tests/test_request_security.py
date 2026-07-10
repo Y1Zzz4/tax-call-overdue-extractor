@@ -23,6 +23,7 @@ from tax_call_overdue_extractor.extraction.service import (
 from tax_call_overdue_extractor.llm.request_builder import (
     ALLOWED_MODEL_DATA_KEYS,
     build_chat_request,
+    build_model_input,
 )
 
 
@@ -116,7 +117,20 @@ def test_dry_run_and_logs_do_not_expose_raw_text_or_api_key(
         assert canaries[column] not in logs
     assert "SECRET_API_KEY" not in stdout
     assert "SECRET_API_KEY" not in logs
-    assert "field=电话录音转文本内容" in stdout
-    assert "field=业务内容" in stdout
-    assert "field=答复内容" in stdout
+    assert "电话录音转文本内容：有效，字符数=" in stdout
+    assert "业务内容：有效，字符数=" in stdout
+    assert "答复内容：有效，字符数=" in stdout
     assert "request_sha256=" in stdout
+
+
+def test_valid_business_content_is_not_converted_to_null() -> None:
+    model_input = build_model_input(
+        voice_text=None,
+        business_content="明确有效的业务内容",
+        reply_content="#N/A",
+    )
+    user_data = json.loads(model_input.serialized_user_message)
+
+    assert user_data["电话录音转文本内容"] is None
+    assert user_data["业务内容"] == "明确有效的业务内容"
+    assert user_data["答复内容"] is None
