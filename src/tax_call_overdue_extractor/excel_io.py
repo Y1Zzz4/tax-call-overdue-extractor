@@ -58,6 +58,17 @@ class SourceWorkbookInfo:
     candidate_rows: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class RowDimensionSnapshot:
+    height: float | None
+    hidden: bool
+    outline_level: int
+    collapsed: bool
+    thick_top: bool
+    thick_bottom: bool
+    style: object | None
+
+
 def resolve_input_file(input_path: str | Path | None, input_dir: Path) -> Path:
     """解析输入文件；未指定时要求 input_dir 下恰好有一个 .xlsx 文件。"""
 
@@ -145,16 +156,16 @@ def create_sample_workbook(
             validate_header(worksheet, header_row)
 
             selected_set = set(selected_rows)
-            header_height = worksheet.row_dimensions[header_row].height
-            selected_heights = {
-                row_index: worksheet.row_dimensions[row_index].height for row_index in selected_rows
+            header_dimension = _capture_row_dimension(worksheet, header_row)
+            selected_dimensions = {
+                row_index: _capture_row_dimension(worksheet, row_index) for row_index in selected_rows
             }
 
             for row_index in range(worksheet.max_row, header_row, -1):
                 if row_index not in selected_set:
                     worksheet.delete_rows(row_index)
 
-            _restore_row_heights(worksheet, header_row, header_height, selected_rows, selected_heights)
+            _restore_row_dimensions(worksheet, header_row, header_dimension, selected_rows, selected_dimensions)
             _update_filter_and_tables(worksheet, header_row, len(selected_rows))
             workbook.save(temp_path)
         finally:
@@ -166,6 +177,7 @@ def create_sample_workbook(
             selected_rows=selected_rows,
             sheet_name=sheet_name,
             header_row=header_row,
+            expected_source_hash=source_hash,
         )
         if hash_file(input_path) != source_hash:
             raise OutputValidationError("原始输入文件在处理过程中发生变化，已放弃输出")
@@ -187,6 +199,7 @@ def validate_sample_output(
     selected_rows: tuple[int, ...],
     sheet_name: str,
     header_row: int,
+    expected_source_hash: str | None = None,
 ) -> None:
     """重新打开输出文件，验证内容、顺序和主要格式均符合抽样结果。"""
 
@@ -220,8 +233,20 @@ def validate_sample_output(
             for column in range(1, len(EXPECTED_COLUMNS) + 1):
                 source_cell = source_sheet.cell(row=source_row, column=column)
                 output_cell = output_sheet.cell(row=output_row, column=column)
-                if output_cell.value != source_cell.value:
-                    raise OutputValidationError("输出单元格内容与源文件抽样行不一致")
+                if not _cell_values_equivalent(source_cell.value, output_cell.value):
+                    raise OutputValidationError(
+                        _cell_value_mismatch_message(
+                            column_name=source_header[column - 1],
+                            source_row=source_row,
+                            output_row=output_row,
+                            source_cell=source_cell,
+                            output_cell=output_cell,
+                            source_hash_changed=_source_hash_changed(
+                                input_path,
+                                expected_source_hash,
+                            ),
+                        )
+                    )
                 if _cell_style_signature(output_cell) != _cell_style_signature(source_cell):
                     raise OutputValidationError("输出单元格主要样式与源文件抽样行不一致")
 
@@ -310,16 +335,47 @@ def _select_worksheet(workbook, sheet_name: str | None, use_active_sheet: bool) 
     raise SheetNotFoundError("未指定工作表，且工作簿包含多个工作表")
 
 
-def _restore_row_heights(
+def _capture_row_dimension(worksheet: Worksheet, row_index: int) -> RowDimensionSnapshot:
+    dimension = worksheet.row_dimensions[row_index]
+    return RowDimensionSnapshot(
+        height=dimension.height,
+        hidden=dimension.hidden,
+        outline_level=dimension.outlineLevel,
+        collapsed=dimension.collapsed,
+        thick_top=dimension.thickTop,
+        thick_bottom=dimension.thickBot,
+        style=copy(getattr(dimension, "_style", None)),
+    )
+
+
+def _restore_row_dimensions(
     worksheet: Worksheet,
     header_row: int,
-    header_height: float | None,
+    header_dimension: RowDimensionSnapshot,
     selected_rows: tuple[int, ...],
-    selected_heights: dict[int, float | None],
+    selected_dimensions: dict[int, RowDimensionSnapshot],
 ) -> None:
-    worksheet.row_dimensions[header_row].height = header_height
+    _apply_row_dimension(worksheet, header_row, header_dimension)
     for offset, source_row in enumerate(selected_rows, start=1):
-        worksheet.row_dimensions[header_row + offset].height = selected_heights.get(source_row)
+        snapshot = selected_dimensions.get(source_row)
+        if snapshot is not None:
+            _apply_row_dimension(worksheet, header_row + offset, snapshot)
+
+
+def _apply_row_dimension(
+    worksheet: Worksheet,
+    row_index: int,
+    snapshot: RowDimensionSnapshot,
+) -> None:
+    dimension = worksheet.row_dimensions[row_index]
+    dimension.height = snapshot.height
+    dimension.hidden = snapshot.hidden
+    dimension.outlineLevel = snapshot.outline_level
+    dimension.collapsed = snapshot.collapsed
+    dimension.thickTop = snapshot.thick_top
+    dimension.thickBot = snapshot.thick_bottom
+    if snapshot.style is not None:
+        dimension._style = copy(snapshot.style)
 
 
 def _update_filter_and_tables(worksheet: Worksheet, header_row: int, data_row_count: int) -> None:
@@ -345,6 +401,78 @@ def _cell_style_signature(cell) -> tuple[object, object, object, object, str]:
         copy(cell.alignment),
         cell.number_format,
     )
+
+
+def _cell_values_equivalent(source_value: object, output_value: object) -> bool:
+    """判断保存前后单元格值是否等价；只容忍 Excel 换行符规范化。"""
+
+    if source_value == output_value:
+        return True
+    if isinstance(source_value, str) and isinstance(output_value, str):
+        return _normalize_newlines(source_value) == _normalize_newlines(output_value)
+    return False
+
+
+def _cell_value_mismatch_message(
+    *,
+    column_name: str,
+    source_row: int,
+    output_row: int,
+    source_cell,
+    output_cell,
+    source_hash_changed: bool | None,
+) -> str:
+    """构造不含单元格真实内容的验证诊断信息。"""
+
+    hash_status = "unknown" if source_hash_changed is None else str(source_hash_changed)
+    return (
+        "输出单元格内容与源文件抽样行不一致 "
+        f"column={column_name!r} "
+        f"source_row={source_row} "
+        f"output_row={output_row} "
+        f"source_value_type={type(source_cell.value).__name__} "
+        f"output_value_type={type(output_cell.value).__name__} "
+        f"source_data_type={source_cell.data_type!r} "
+        f"output_data_type={output_cell.data_type!r} "
+        f"source_text_length={_text_length(source_cell.value)} "
+        f"output_text_length={_text_length(output_cell.value)} "
+        f"same_after_strip={_same_after_strip(source_cell.value, output_cell.value)} "
+        f"same_after_newline_normalize={_same_after_newline_normalize(source_cell.value, output_cell.value)} "
+        f"same_after_whitespace_collapse={_same_after_whitespace_collapse(source_cell.value, output_cell.value)} "
+        f"source_hash_changed={hash_status}"
+    )
+
+
+def _source_hash_changed(input_path: Path, expected_source_hash: str | None) -> bool | None:
+    if expected_source_hash is None:
+        return None
+    return hash_file(input_path) != expected_source_hash
+
+
+def _text_length(value: object) -> int | str:
+    return len(value) if isinstance(value, str) else "n/a"
+
+
+def _same_after_strip(source_value: object, output_value: object) -> bool | str:
+    if not isinstance(source_value, str) or not isinstance(output_value, str):
+        return "n/a"
+    return source_value.strip() == output_value.strip()
+
+
+def _same_after_newline_normalize(source_value: object, output_value: object) -> bool | str:
+    if not isinstance(source_value, str) or not isinstance(output_value, str):
+        return "n/a"
+    return _normalize_newlines(source_value) == _normalize_newlines(output_value)
+
+
+def _same_after_whitespace_collapse(source_value: object, output_value: object) -> bool | str:
+    if not isinstance(source_value, str) or not isinstance(output_value, str):
+        return "n/a"
+    return " ".join(source_value.split()) == " ".join(output_value.split())
+
+
+def _normalize_newlines(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _validate_dimensions_and_sheet_properties(

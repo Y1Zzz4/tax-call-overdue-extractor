@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -16,8 +17,8 @@ from tax_call_overdue_extractor.config import (
     ProjectSettings,
     SamplingSettings,
 )
-from tax_call_overdue_extractor.excel_io import EXPECTED_COLUMNS, hash_file
-from tax_call_overdue_extractor.exceptions import ExcelIOError, SamplingError
+from tax_call_overdue_extractor.excel_io import EXPECTED_COLUMNS, hash_file, validate_sample_output
+from tax_call_overdue_extractor.exceptions import ExcelIOError, OutputValidationError, SamplingError
 from tax_call_overdue_extractor.sampling import is_valid_call_text, sample_excel_file
 
 
@@ -139,6 +140,25 @@ def read_column_values(path: Path, column: int) -> list[object]:
         return [worksheet.cell(row=row, column=column).value for row in range(2, worksheet.max_row + 1)]
     finally:
         workbook.close()
+
+
+def rewrite_business_text_newlines_as_crlf_entities(path: Path, row_count: int) -> None:
+    """把测试源文件中的业务内容换行改成 OOXML CRLF 表示。"""
+
+    entries: list[tuple[str, bytes]] = []
+    with ZipFile(path, "r") as source_zip:
+        for item in source_zip.infolist():
+            content = source_zip.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                text = content.decode("utf-8")
+                for index in range(1, row_count + 1):
+                    text = text.replace(f"业务内容 {index}", f"业务内容&#13;\n{index}")
+                content = text.encode("utf-8")
+            entries.append((item.filename, content))
+
+    with ZipFile(path, "w", ZIP_DEFLATED) as output_zip:
+        for filename, content in entries:
+            output_zip.writestr(filename, content)
 
 
 def test_extracts_50_rows_normally(tmp_path: Path) -> None:
@@ -329,6 +349,34 @@ def test_header_columns_values_and_styles_are_preserved(tmp_path: Path) -> None:
         output_workbook.close()
 
 
+def test_newline_normalization_is_accepted_as_equivalent_content(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=20)
+    rewrite_business_text_newlines_as_crlf_entities(source, row_count=20)
+
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=5,
+        seed=2026,
+    )
+
+    source_workbook = load_workbook(source)
+    output_workbook = load_workbook(output)
+    try:
+        source_sheet = source_workbook.active
+        output_sheet = output_workbook.active
+        assert "\r\n" in source_sheet.cell(row=result.selected_rows[0], column=10).value
+        assert "\n" in output_sheet.cell(row=2, column=10).value
+        assert "\r\n" not in output_sheet.cell(row=2, column=10).value
+    finally:
+        source_workbook.close()
+        output_workbook.close()
+
+
 def test_insufficient_candidates_raise_error_and_no_output(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     source = settings.paths.input_dir / "source.xlsx"
@@ -392,3 +440,131 @@ def test_input_file_is_not_modified(tmp_path: Path) -> None:
     )
 
     assert hash_file(source) == before
+
+
+def test_value_mismatch_reports_non_sensitive_debug_info(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=20)
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=5,
+        seed=2026,
+    )
+
+    changed_value = "debug-mutated-business-content"
+    workbook = load_workbook(output)
+    try:
+        worksheet = workbook.active
+        worksheet.cell(row=2, column=10).value = changed_value
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    with pytest.raises(OutputValidationError) as exc_info:
+        validate_sample_output(
+            input_path=source,
+            output_path=output,
+            selected_rows=result.selected_rows,
+            sheet_name=result.sheet_name,
+            header_row=1,
+            expected_source_hash=hash_file(source),
+        )
+
+    message = str(exc_info.value)
+    assert "输出单元格内容与源文件抽样行不一致" in message
+    assert "column='业务内容'" in message
+    assert f"source_row={result.selected_rows[0]}" in message
+    assert "output_row=2" in message
+    assert "source_value_type=str" in message
+    assert "output_value_type=str" in message
+    assert "source_data_type='s'" in message
+    assert "output_data_type='s'" in message
+    assert "source_text_length=" in message
+    assert "output_text_length=" in message
+    assert "same_after_strip=" in message
+    assert "same_after_newline_normalize=" in message
+    assert "same_after_whitespace_collapse=" in message
+    assert "source_hash_changed=False" in message
+    assert changed_value not in message
+    assert f"业务内容 {result.selected_rows[0] - 1}" not in message
+
+
+def test_value_mismatch_reports_source_hash_change(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=20)
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=5,
+        seed=2026,
+    )
+    expected_source_hash = hash_file(source)
+
+    changed_value = "debug-mutated-source-content"
+    workbook = load_workbook(source)
+    try:
+        worksheet = workbook.active
+        worksheet.cell(row=result.selected_rows[0], column=10).value = changed_value
+        workbook.save(source)
+    finally:
+        workbook.close()
+
+    with pytest.raises(OutputValidationError) as exc_info:
+        validate_sample_output(
+            input_path=source,
+            output_path=output,
+            selected_rows=result.selected_rows,
+            sheet_name=result.sheet_name,
+            header_row=1,
+            expected_source_hash=expected_source_hash,
+        )
+
+    message = str(exc_info.value)
+    assert "column='业务内容'" in message
+    assert f"source_row={result.selected_rows[0]}" in message
+    assert "output_row=2" in message
+    assert "source_hash_changed=True" in message
+    assert changed_value not in message
+
+
+def test_value_mismatch_debug_flags_whitespace_only_difference(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=20)
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=5,
+        seed=2026,
+    )
+
+    workbook = load_workbook(output)
+    try:
+        worksheet = workbook.active
+        worksheet.cell(row=2, column=10).value = f"  {worksheet.cell(row=2, column=10).value}  "
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    with pytest.raises(OutputValidationError) as exc_info:
+        validate_sample_output(
+            input_path=source,
+            output_path=output,
+            selected_rows=result.selected_rows,
+            sheet_name=result.sheet_name,
+            header_row=1,
+            expected_source_hash=hash_file(source),
+        )
+
+    message = str(exc_info.value)
+    assert "same_after_strip=True" in message
+    assert "same_after_whitespace_collapse=True" in message

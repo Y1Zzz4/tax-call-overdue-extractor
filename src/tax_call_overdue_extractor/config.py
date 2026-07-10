@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from dotenv import dotenv_values
 import yaml
 
 from .exceptions import ConfigError
@@ -48,6 +49,20 @@ class LLMReservedSettings:
     max_concurrency: int
     max_retries: int
     timeout_seconds: int
+    max_input_chars: int = 12000
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    base_url: str = "https://llmapi.paratera.com"
+    api_key: str = ""
+    model: str = "DeepSeek-V4-Pro"
+    timeout_seconds: int = 120
+    max_retries: int = 3
+    temperature: float = 0.0
+    max_output_tokens: int = 4096
+    response_format_mode: str = "auto"
+    max_input_chars: int = 12000
 
 
 @dataclass(frozen=True)
@@ -57,6 +72,7 @@ class ProjectSettings:
     sampling: SamplingSettings
     logging: LoggingSettings
     llm_reserved: LLMReservedSettings
+    llm: LLMSettings = field(default_factory=LLMSettings)
 
 
 def load_settings(config_path: str | Path | None = None) -> ProjectSettings:
@@ -83,6 +99,7 @@ def load_settings(config_path: str | Path | None = None) -> ProjectSettings:
     sampling = _as_mapping(data.get("sampling"), "sampling")
     logging_config = _as_mapping(data.get("logging"), "logging")
     llm_reserved = _as_mapping(data.get("llm_reserved"), "llm_reserved")
+    env = _load_env(project_root)
 
     return ProjectSettings(
         paths=PathSettings(
@@ -120,6 +137,50 @@ def load_settings(config_path: str | Path | None = None) -> ProjectSettings:
             timeout_seconds=_positive_int(
                 llm_reserved.get("timeout_seconds"), "llm_reserved.timeout_seconds"
             ),
+            max_input_chars=_positive_int(
+                llm_reserved.get("max_input_chars", 12000), "llm_reserved.max_input_chars"
+            ),
+        ),
+        llm=_load_llm_settings(env, llm_reserved),
+    )
+
+
+def _load_env(project_root: Path) -> Mapping[str, str | None]:
+    env_path = project_root / ".env"
+    if not env_path.exists():
+        return {}
+    return dotenv_values(env_path)
+
+
+def _load_llm_settings(
+    env: Mapping[str, str | None],
+    llm_reserved: Mapping[str, Any],
+) -> LLMSettings:
+    max_input_default = _positive_int(
+        llm_reserved.get("max_input_chars", 12000), "llm_reserved.max_input_chars"
+    )
+    response_format_mode = _env_str(env, "LLM_RESPONSE_FORMAT_MODE", "auto").lower()
+    if response_format_mode not in {"auto", "json_object", "none"}:
+        raise ConfigError("LLM_RESPONSE_FORMAT_MODE 必须是 auto、json_object 或 none")
+
+    return LLMSettings(
+        base_url=_env_str(env, "LLM_BASE_URL", "https://llmapi.paratera.com"),
+        api_key=_env_str(env, "LLM_API_KEY", ""),
+        model=_env_str(env, "LLM_MODEL", "DeepSeek-V4-Pro"),
+        timeout_seconds=_positive_int(
+            _env_str(env, "LLM_TIMEOUT_SECONDS", "120"), "LLM_TIMEOUT_SECONDS"
+        ),
+        max_retries=_non_negative_int(
+            _env_str(env, "LLM_MAX_RETRIES", "3"), "LLM_MAX_RETRIES"
+        ),
+        temperature=_float_value(_env_str(env, "LLM_TEMPERATURE", "0"), "LLM_TEMPERATURE"),
+        max_output_tokens=_positive_int(
+            _env_str(env, "LLM_MAX_OUTPUT_TOKENS", "4096"), "LLM_MAX_OUTPUT_TOKENS"
+        ),
+        response_format_mode=response_format_mode,
+        max_input_chars=_positive_int(
+            _env_str(env, "LLM_MAX_INPUT_CHARS", str(max_input_default)),
+            "LLM_MAX_INPUT_CHARS",
         ),
     )
 
@@ -142,6 +203,13 @@ def _resolve_path(value: Any, root: Path, name: str) -> Path:
         raise ConfigError(f"配置项 {name} 不能为空")
     path = Path(str(value))
     return path if path.is_absolute() else root / path
+
+
+def _env_str(env: Mapping[str, str | None], key: str, default: str) -> str:
+    value = env.get(key)
+    if value is None:
+        return default
+    return str(value)
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -171,6 +239,13 @@ def _optional_int(value: Any, name: str) -> int | None:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"配置项 {name} 必须是整数或 null") from exc
+
+
+def _float_value(value: Any, name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"配置项 {name} 必须是数字") from exc
 
 
 def _optional_str(value: Any, name: str) -> str | None:

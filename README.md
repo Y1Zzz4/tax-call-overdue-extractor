@@ -1,18 +1,18 @@
 # tax-call-overdue-extractor
 
-用于分析税务电话记录并提取逾期信息的 Python 项目。本轮已实现 Excel 随机抽样能力，并为后续大模型结构化提取、字段标准化、冲突处理、断点续跑和全量处理保留配置与目录结构。
+用于分析税务电话记录并提取逾期信息的 Python 项目。当前已实现 Excel 随机抽样，以及对抽样 Excel 中单条记录进行大模型结构化提取的预览能力。
 
 ## 数据安全约束
 
-本轮功能只做本地 Excel 抽样，不调用大模型，不读取 `.env`，不会发送任何业务数据。
+抽样功能只在本地处理 Excel，不读取 `.env`，不会发送任何业务数据。单条提取功能调用外部 OpenAI 兼容模型时，只允许向模型发送以下三列：
 
-后续接入模型时，只允许向模型发送以下三列：
-
-- 语音转文本
+- 电话录音转文本内容
 - 业务内容
 - 答复内容
 
-来电号码、登记人姓名、业务编号、企业名称等字段不得发送给外部模型。代码和日志也不得输出 API Key、电话文本、业务内容、答复内容、电话、姓名、企业名称等敏感原始数据。
+当前 Excel 的真实列名为“语音转文本”，程序读取该列后会在模型请求 JSON 中映射为“电话录音转文本内容”。发送给模型的 user message 只包含这三个键。空单元格、空白字符串和 `#N/A` 会转换为 `null`。
+
+来电号码、登记人姓名、业务编号、登记日期、企业名称、Excel 行号、文件路径、工作表名称等字段不得发送给外部模型。代码和日志也不得输出 API Key、Authorization Header、三列原文、模型完整响应、电话、姓名、企业名称等敏感信息。原始模型响应如需保存，只能保存到被 Git 忽略的 `data/state/` 下。
 
 ## 目录结构
 
@@ -33,9 +33,13 @@ tax-call-overdue-extractor/
 │   ├── state/
 │   └── logs/
 ├── scripts/
-│   └── sample_excel.py
+│   ├── sample_excel.py
+│   └── extract_one.py
 ├── src/
 │   └── tax_call_overdue_extractor/
+│       ├── extraction/
+│       ├── llm/
+│       └── prompt_templates/
 └── tests/
 ```
 
@@ -119,6 +123,96 @@ python -m tax_call_overdue_extractor.cli sample \
 
 “业务内容”或“答复内容”为空或为 `#N/A` 不影响抽样。
 
+## 配置 LLM
+
+复制环境变量示例：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，至少填写：
+
+```text
+LLM_BASE_URL=https://llmapi.paratera.com
+LLM_API_KEY=你的密钥
+LLM_MODEL=DeepSeek-V4-Pro
+```
+
+其他可选项：
+
+```text
+LLM_TIMEOUT_SECONDS=120
+LLM_MAX_RETRIES=3
+LLM_TEMPERATURE=0
+LLM_MAX_OUTPUT_TOKENS=4096
+LLM_RESPONSE_FORMAT_MODE=auto
+LLM_MAX_INPUT_CHARS=12000
+```
+
+`LLM_RESPONSE_FORMAT_MODE` 支持 `auto`、`json_object`、`none`。如果中转 API 不支持 `response_format`，将其改为 `none` 即可，不需要改代码。
+
+切换到服务器本地 OpenAI 兼容模型时，只需要修改 `.env` 中的 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL`。如果 endpoint 需要 `/v1`，应直接写在 `LLM_BASE_URL` 中，例如：
+
+```text
+LLM_BASE_URL=http://127.0.0.1:8000/v1
+```
+
+## 单条提取 dry-run
+
+先从抽样文件中选择一个 Excel 实际行号，第一条数据通常是第 2 行。
+
+方式一：
+
+```bash
+python scripts/extract_one.py --row-number 2 --dry-run
+```
+
+方式二：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-one --row-number 2 --dry-run
+```
+
+dry-run 会读取指定行并构建即将发送给模型的请求，但不会调用 API，也不会输出原文。终端只显示三个允许字段的字段名、是否为空、字符数、总字符数、请求 SHA-256 摘要、模型名称和 BASE_URL。
+
+## 单条真实调用
+
+确认 `.env` 已配置后执行：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-one --row-number 2
+```
+
+默认输入为 `data/samples/` 下唯一的 `.xlsx` 文件。也可以显式指定：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-one \
+  --input data/samples/source_sample_50.xlsx \
+  --row-number 2 \
+  --output data/state/preview/row_2.json
+```
+
+默认输出到：
+
+```text
+data/state/preview/row_<row-number>.json
+```
+
+默认不覆盖已有 JSON，确需覆盖时增加 `--overwrite`。
+
+输出 JSON 顶层包含：
+
+- `status`：`success`、`no_text` 或 `input_too_long`
+- `called_api`：是否实际调用模型
+- `model`、`base_url`
+- `input_total_chars`
+- `request_sha256`
+- `raw_response_path`
+- `result`：通过 Pydantic v2 校验后的结构化 `ExtractionResult`
+
+`ExtractionResult` 包含 `schema_version`、`has_relevant_information`、`items`、`conflicts`、`needs_review`、`review_reasons`。模型输出必须符合 Schema，非法 JSON、非法税种、非法 evidence source、非法月份等都会被拒绝。
+
 ## Excel 格式保留说明
 
 抽样不会用 pandas 重建工作簿。实现方式是先复制原始 `.xlsx` 到临时文件，再从下到上删除未抽中的数据行，随后更新自动筛选和 Excel 表格对象范围，保存并重新读取验证，最后原子移动到最终输出路径。
@@ -133,9 +227,18 @@ pytest
 
 测试数据会在临时目录中自动生成，不使用真实业务数据。
 
+## 本阶段尚未实现
+
+- 50 条批量调用
+- 最终 Excel 回填
+- 多结果插入 Excel 新行
+- 全量并发处理
+- 完整所属期本地换算
+- 最终逾期判断
+- SQLite 断点续跑
+
 ## 后续开发路线
 
-- LLM 严格 JSON 结构化提取
 - 税种标准化
 - 所属期本地换算
 - 逾期规则判断
