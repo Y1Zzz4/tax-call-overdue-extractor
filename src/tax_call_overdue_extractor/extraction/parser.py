@@ -46,7 +46,7 @@ def parse_extraction_response(
     """解析模型响应并执行完整 Schema 校验。"""
 
     try:
-        data: Any = _load_json_object(raw_response)
+        data: Any = load_json_object(raw_response)
     except json.JSONDecodeError as exc:
         raise ResponseParseError(f"模型响应不是合法 JSON: {exc.msg}") from exc
 
@@ -69,7 +69,7 @@ def preprocess_response_payload(
         return data
     texts = {name: source_texts.get(name) for name in ALLOWED_SOURCE_NAMES}
     normalized = deepcopy(data)
-    local_enterprise = _find_enterprise_name(texts)
+    local_enterprise = find_high_confidence_enterprise(texts)
     if local_enterprise is not None:
         normalized["conflicts"] = []
     items = normalized.get("items")
@@ -85,10 +85,18 @@ def preprocess_response_payload(
         notes: list[str] = _reason_list(item.get("review_reasons"))
         if local_enterprise is not None:
             enterprise_name, source, quote = local_enterprise
-            if item.get("enterprise_name") != enterprise_name:
+            current_name = normalize_enterprise_name_candidate(str(item.get("enterprise_name") or ""))
+            should_replace = (
+                current_name is None
+                or len(items) == 1
+                or current_name in enterprise_name
+                or enterprise_name in current_name
+            )
+            if should_replace and current_name != enterprise_name:
                 notes.append(f"按{source}补充企业名称")
-            item["enterprise_name"] = enterprise_name
-            item["enterprise_evidence"] = [{"source": source, "quote": quote}]
+            if should_replace:
+                item["enterprise_name"] = enterprise_name
+                item["enterprise_evidence"] = [{"source": source, "quote": quote}]
         elif item.get("enterprise_name"):
             cleaned_enterprise = normalize_enterprise_name_candidate(str(item["enterprise_name"]))
             if cleaned_enterprise is None:
@@ -199,25 +207,18 @@ ENTERPRISE_AFTER_CREDIT_CODE = re.compile(
 LABELED_ENTERPRISE = re.compile(
     rf"(?:企业(?:名称)?|公司名称|纳税人)\s*[:：为]\s*([^，,；;。！？?\n]{{2,80}}{ENTERPRISE_SUFFIX})"
 )
-GENERAL_ENTERPRISE = re.compile(
-    rf"(?:^|[\s，,；;。！？?：:\-—])"
-    rf"([\u4e00-\u9fffA-Za-z（）()]{{3,60}}{ENTERPRISE_SUFFIX})"
-    rf"(?=$|[\s，,；;。！？?、（）()0-9])"
-)
-
-
-def _find_enterprise_name(
+def find_high_confidence_enterprise(
     source_texts: dict[str, str | None],
 ) -> tuple[str, str, str] | None:
     """按业务内容、答复内容、电话录音顺序做保守的企业名称兜底。"""
 
     for source in SOURCE_PRIORITY:
         text = source_texts.get(source) or ""
-        for pattern in (ENTERPRISE_AFTER_CREDIT_CODE, LABELED_ENTERPRISE, GENERAL_ENTERPRISE):
+        for pattern in (ENTERPRISE_AFTER_CREDIT_CODE, LABELED_ENTERPRISE):
             match = pattern.search(text)
             if not match:
                 continue
-            name = normalize_enterprise_name_candidate(match.group(1).strip(" -—:："))
+            name = normalize_enterprise_name_candidate(match.group(1).strip(" # -—:："))
             if name is not None:
                 return name, source, name
     return None
@@ -398,7 +399,7 @@ def _strip_code_fence(raw_response: str) -> str:
     return match.group(1).strip()
 
 
-def _load_json_object(raw_response: str) -> Any:
+def load_json_object(raw_response: str) -> Any:
     """接受纯 JSON、代码块以及 JSON 前后夹有少量说明文字的常见响应。"""
 
     text = _strip_code_fence(raw_response)

@@ -27,12 +27,18 @@ from tax_call_overdue_extractor.llm.request_builder import BUSINESS_CONTENT_KEY,
 from .batch_models import BatchPlan, BatchRecord, BatchRunSummary, BatchStatus, NormalizedItem, RowBatchOutcome, TextStats
 from .normalization import normalize_extraction_result, parse_reference_month
 from .parser import parse_extraction_response
+from .enterprise_review import (
+    apply_enterprise_review,
+    load_enterprise_review_prompt,
+    parse_enterprise_review,
+)
 from .schemas import ExtractionResult, STANDARD_TAX_TYPES, no_text_result
 from .state_store import BatchStateStore
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = "1.0"
+# 同时覆盖 Schema 和本地解析规则；规则变化时递增，避免复用旧结果。
+SCHEMA_VERSION = "2.0"
 SAFE_SAMPLE_LIMIT = 100
 RESULT_COLUMNS = {
     "企业名称": 12,
@@ -88,7 +94,7 @@ class BatchExtractionService:
         state_db = options.state_db_path or self._settings.paths.state_dir / "batch_state.sqlite3"
         concurrency = options.concurrency or self._settings.llm_reserved.max_concurrency or 2
         prompt = self._system_prompt if self._system_prompt is not None else load_system_prompt()
-        prompt_hash = _sha256_text(prompt)
+        prompt_hash = _sha256_text(prompt + "\n" + load_enterprise_review_prompt())
         source_fingerprint = hash_file(source_path)
 
         records, sheet_name, total_rows = read_batch_records(
@@ -120,13 +126,14 @@ class BatchExtractionService:
 
         eligible = sum(1 for record in records if record.model_input.has_any_text)
         too_long = sum(1 for record in records if record.model_input.total_chars > self._settings.llm.max_input_chars)
-        estimated_api = sum(
+        estimated_records = sum(
             1
             for record in records
             if record.model_input.has_any_text and record.model_input.total_chars <= self._settings.llm.max_input_chars
         )
         if options.resume:
-            estimated_api = max(0, estimated_api - reusable)
+            estimated_records = max(0, estimated_records - reusable)
+        estimated_api = estimated_records * 2
 
         plan = BatchPlan(
             input_path=source_path,
@@ -306,6 +313,36 @@ class BatchExtractionService:
                     response = await asyncio.to_thread(client.complete, request)
                 raw_path = _save_raw_response(self._settings.paths.state_dir, run_id, record.original_row_number, response.content)
                 result = parse_extraction_response(response.content, dict(record.model_input.data))
+                try:
+                    enterprise_request = build_chat_request(
+                        load_enterprise_review_prompt(),
+                        record.model_input,
+                    )
+                    if self._llm_client is not None:
+                        enterprise_response = client.complete(enterprise_request)
+                    else:
+                        enterprise_response = await asyncio.to_thread(client.complete, enterprise_request)
+                    _save_enterprise_review_response(
+                        self._settings.paths.state_dir,
+                        run_id,
+                        record.original_row_number,
+                        enterprise_response.content,
+                    )
+                    decisions = parse_enterprise_review(
+                        enterprise_response.content,
+                        record.model_input.data,
+                    )
+                    result = apply_enterprise_review(
+                        result,
+                        decisions,
+                        record.model_input.data,
+                    )
+                except (ValueError, LLMClientError) as exc:
+                    LOGGER.warning(
+                        "企业名称复核失败，保留首次提取结果 row=%s error=%s",
+                        record.original_row_number,
+                        exc.__class__.__name__,
+                    )
                 normalized = normalize_extraction_result(result, reference_month=record.reference_month)
                 status = _status_for_result(result, normalized)
                 structured_path = _save_structured_result(self._settings.paths.state_dir, run_id, record.original_row_number, result, status)
@@ -641,6 +678,19 @@ def _save_raw_response(state_dir: Path, run_id: str, row_number: int, content: s
     directory = _row_run_directory(state_dir, run_id, row_number)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "response.txt"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _save_enterprise_review_response(
+    state_dir: Path,
+    run_id: str,
+    row_number: int,
+    content: str,
+) -> Path:
+    directory = _row_run_directory(state_dir, run_id, row_number)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "enterprise_review.txt"
     path.write_text(content, encoding="utf-8")
     return path
 
