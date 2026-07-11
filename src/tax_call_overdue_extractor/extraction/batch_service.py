@@ -27,10 +27,10 @@ from tax_call_overdue_extractor.llm.request_builder import BUSINESS_CONTENT_KEY,
 from .batch_models import BatchPlan, BatchRecord, BatchRunSummary, BatchStatus, NormalizedItem, RowBatchOutcome, TextStats
 from .normalization import normalize_extraction_result, parse_reference_month
 from .parser import parse_extraction_response
-from .enterprise_review import (
-    apply_enterprise_review,
-    load_enterprise_review_prompt,
-    parse_enterprise_review,
+from .precision_review import (
+    apply_precision_review,
+    load_precision_review_prompt,
+    parse_precision_review,
 )
 from .schemas import ExtractionResult, STANDARD_TAX_TYPES, no_text_result
 from .state_store import BatchStateStore
@@ -94,7 +94,7 @@ class BatchExtractionService:
         state_db = options.state_db_path or self._settings.paths.state_dir / "batch_state.sqlite3"
         concurrency = options.concurrency or self._settings.llm_reserved.max_concurrency or 2
         prompt = self._system_prompt if self._system_prompt is not None else load_system_prompt()
-        prompt_hash = _sha256_text(prompt + "\n" + load_enterprise_review_prompt())
+        prompt_hash = _sha256_text(prompt + "\n" + load_precision_review_prompt())
         source_fingerprint = hash_file(source_path)
 
         records, sheet_name, total_rows = read_batch_records(
@@ -314,32 +314,32 @@ class BatchExtractionService:
                 raw_path = _save_raw_response(self._settings.paths.state_dir, run_id, record.original_row_number, response.content)
                 result = parse_extraction_response(response.content, dict(record.model_input.data))
                 try:
-                    enterprise_request = build_chat_request(
-                        load_enterprise_review_prompt(),
+                    precision_request = build_chat_request(
+                        load_precision_review_prompt(),
                         record.model_input,
                     )
                     if self._llm_client is not None:
-                        enterprise_response = client.complete(enterprise_request)
+                        precision_response = client.complete(precision_request)
                     else:
-                        enterprise_response = await asyncio.to_thread(client.complete, enterprise_request)
-                    _save_enterprise_review_response(
+                        precision_response = await asyncio.to_thread(client.complete, precision_request)
+                    _save_precision_review_response(
                         self._settings.paths.state_dir,
                         run_id,
                         record.original_row_number,
-                        enterprise_response.content,
+                        precision_response.content,
                     )
-                    decisions = parse_enterprise_review(
-                        enterprise_response.content,
+                    precision_review = parse_precision_review(
+                        precision_response.content,
                         record.model_input.data,
                     )
-                    result = apply_enterprise_review(
+                    result = apply_precision_review(
                         result,
-                        decisions,
+                        precision_review,
                         record.model_input.data,
                     )
                 except (ValueError, LLMClientError) as exc:
                     LOGGER.warning(
-                        "企业名称复核失败，保留首次提取结果 row=%s error=%s",
+                        "精度复核失败，保留首次提取结果 row=%s error=%s",
                         record.original_row_number,
                         exc.__class__.__name__,
                     )
@@ -682,7 +682,7 @@ def _save_raw_response(state_dir: Path, run_id: str, row_number: int, content: s
     return path
 
 
-def _save_enterprise_review_response(
+def _save_precision_review_response(
     state_dir: Path,
     run_id: str,
     row_number: int,
@@ -690,7 +690,7 @@ def _save_enterprise_review_response(
 ) -> Path:
     directory = _row_run_directory(state_dir, run_id, row_number)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "enterprise_review.txt"
+    path = directory / "precision_review.txt"
     path.write_text(content, encoding="utf-8")
     return path
 

@@ -72,8 +72,10 @@ class NormalizedPeriod:
     text: str
     start_year: int | None
     start_month: int | None
+    start_day: int | None
     end_year: int | None
     end_month: int | None
+    end_day: int | None
     granularity: str
     reliable: bool
     raw_text: str

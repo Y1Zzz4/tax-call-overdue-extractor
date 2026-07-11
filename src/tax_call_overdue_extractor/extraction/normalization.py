@@ -21,8 +21,27 @@ GENERIC_ENTERPRISE_FRAGMENTS = {
     "本公司",
     "所在公司",
     "成立的公司",
+    "来电人",
+    "任职于",
+    "是个合伙企业",
+    "不是科技有限公司",
+    "我们是贸易公司",
+    "我是一家分公司",
+    "一家分公司",
+    "因我们",
+}
+GENERIC_ENTERPRISE_NAMES = {
+    "公司",
+    "企业",
+    "贸易公司",
+    "科技有限公司",
+    "信息技术有限公司",
+    "电器有限公司",
+    "分公司",
+    "合伙企业",
 }
 CHINESE_SEMICOLON = "；"
+REFERENCE_YEAR = 2026
 
 
 def normalize_extraction_result(
@@ -50,6 +69,8 @@ def normalize_item(
 ) -> NormalizedItem:
     enterprise_name = _normalize_enterprise_name(item.enterprise_name)
     tax_types = _dedupe([tax_type for tax_type in item.tax_types if tax_type in STANDARD_TAX_TYPES])
+    if len(tax_types) > 1 and "未识别" in tax_types:
+        tax_types.remove("未识别")
     periods, period_notes = _normalize_periods(item.periods, reference_month)
     amounts, amount_notes = _normalize_amounts(item)
     conflicts = list(model_conflicts or [])
@@ -117,12 +138,14 @@ def normalize_enterprise_name_candidate(value: str | None) -> str | None:
 
     if value is None:
         return None
-    text = value.strip(" \t\r\n，,。；;：:")
-    if text == "" or text in PRONOUN_ENTERPRISE_NAMES:
+    text = value.strip(" #\t\r\n，,。；;：:")
+    if text == "" or text in PRONOUN_ENTERPRISE_NAMES or text in GENERIC_ENTERPRISE_NAMES:
         return None
     if any(fragment in text for fragment in GENERIC_ENTERPRISE_FRAGMENTS):
         return None
-    if text.startswith(("因为", "所以", "然后", "现在", "目前", "我们", "这个", "那个")):
+    if text.startswith(("因为", "所以", "然后", "现在", "目前", "我们", "这个", "那个", "不是", "他是", "我是")):
+        return None
+    if re.search(r"的.{0,4}(?:哪|什么).{0,12}(?:公司|企业|店|厂)$", text):
         return None
     return text
 
@@ -135,10 +158,15 @@ def _normalize_periods(
     reviews: list[str] = []
     for period in periods:
         converted = _normalize_period(period, reference_month)
-        normalized.append(converted)
-        if not converted.reliable:
-            reviews.append("unresolved_period")
-    return normalized, _dedupe(reviews)
+        if converted.reliable:
+            normalized.append(converted)
+        else:
+            reviews.append(f"所属期无法规范化：{period.raw_text}")
+    compacted = _compact_periods(normalized)
+    if compacted:
+        # 同一个口语日期可能被模型同时返回为结构化项和原文项；已有可靠结果时不再提示失败副本。
+        reviews = [review for review in reviews if not _review_duplicates_period(review, compacted)]
+    return compacted, _dedupe(reviews)
 
 
 def _normalize_period(period: PeriodMention, reference_month: ReferenceMonth | None) -> NormalizedPeriod:
@@ -147,21 +175,22 @@ def _normalize_period(period: PeriodMention, reference_month: ReferenceMonth | N
         return direct
 
     raw_text = period.relative_expression or period.raw_text
-    if reference_month is not None:
-        relative = _from_relative_text(raw_text, reference_month)
-        if relative is not None:
-            return relative
+    relative = _from_relative_text(raw_text, reference_month)
+    if relative is not None:
+        return relative
 
     parsed = _from_raw_absolute_text(period.raw_text)
     if parsed is not None:
         return parsed
 
     return NormalizedPeriod(
-        text=period.raw_text,
+        text="未识别",
         start_year=None,
         start_month=None,
+        start_day=None,
         end_year=None,
         end_month=None,
+        end_day=None,
         granularity=str(period.period_type),
         reliable=False,
         raw_text=period.raw_text,
@@ -180,12 +209,57 @@ def _from_structured_period(period: PeriodMention) -> NormalizedPeriod | None:
             int(period.end_month),
             granularity,
             period.raw_text,
+            start_day=period.start_day,
+            end_day=period.end_day,
         )
     return None
 
 
 def _from_raw_absolute_text(raw_text: str) -> NormalizedPeriod | None:
-    text = raw_text.strip()
+    text = _normalize_spoken_years(raw_text.strip())
+    iso_date_range = re.search(
+        r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\s*(?:至|到|[-—~～])\s*"
+        r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})",
+        text,
+    )
+    if iso_date_range:
+        sy, sm, sd, ey, em, ed = (int(value) for value in iso_date_range.groups())
+        return _period(sy, sm, ey, em, "date_range", raw_text, start_day=sd, end_day=ed)
+
+    date_range = re.search(
+        r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日\s*(?:至|到|[-—~～])\s*"
+        r"(?:(\d{4})年\s*)?(\d{1,2})月\s*(\d{1,2})日",
+        text,
+    )
+    if date_range:
+        sy, sm, sd, ey, em, ed = date_range.groups()
+        return _period(
+            int(sy), int(sm), int(ey or sy), int(em), "date_range", raw_text,
+            start_day=int(sd), end_day=int(ed),
+        )
+
+    single_date = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+    if single_date:
+        year, month, day = (int(value) for value in single_date.groups())
+        return _period(
+            year, month, year, month, "single_date", raw_text,
+            start_day=day, end_day=day,
+        )
+
+    iso_single_date = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if iso_single_date:
+        year, month, day = (int(value) for value in iso_single_date.groups())
+        return _period(
+            year, month, year, month, "single_date", raw_text,
+            start_day=day, end_day=day,
+        )
+
+    range_match = re.search(r"(\d{4})年\s*(\d{1,2})月.*?(\d{4})年\s*(\d{1,2})月", text)
+    if range_match:
+        sy, sm, ey, em = (int(value) for value in range_match.groups())
+        if 1 <= sm <= 12 and 1 <= em <= 12:
+            return _period(sy, sm, ey, em, "month_range", raw_text)
+
     year_match = re.fullmatch(r"(\d{4})年", text)
     if year_match:
         year = int(year_match.group(1))
@@ -198,12 +272,6 @@ def _from_raw_absolute_text(raw_text: str) -> NormalizedPeriod | None:
         if 1 <= month <= 12:
             return _period(year, month, year, month, "month", raw_text)
 
-    range_match = re.search(r"(\d{4})年\s*(\d{1,2})月.*?(\d{4})年\s*(\d{1,2})月", text)
-    if range_match:
-        sy, sm, ey, em = (int(value) for value in range_match.groups())
-        if 1 <= sm <= 12 and 1 <= em <= 12:
-            return _period(sy, sm, ey, em, "month_range", raw_text)
-
     quarter_match = re.search(r"(\d{4})年\s*第?([一二三四1234])季度", text)
     if quarter_match:
         year = int(quarter_match.group(1))
@@ -214,20 +282,37 @@ def _from_raw_absolute_text(raw_text: str) -> NormalizedPeriod | None:
     return None
 
 
-def _from_relative_text(raw_text: str, reference_month: ReferenceMonth) -> NormalizedPeriod | None:
+def _from_relative_text(
+    raw_text: str,
+    reference_month: ReferenceMonth | None,
+) -> NormalizedPeriod | None:
     text = raw_text.strip()
+    if text == "今年":
+        return _period(REFERENCE_YEAR, 1, REFERENCE_YEAR, 12, "relative", raw_text)
+    if text == "去年":
+        return _period(REFERENCE_YEAR - 1, 1, REFERENCE_YEAR - 1, 12, "relative", raw_text)
+    this_year_month = re.fullmatch(r"今年\s*(\d{1,2})月", text)
+    if this_year_month:
+        month = int(this_year_month.group(1))
+        if 1 <= month <= 12:
+            return _period(REFERENCE_YEAR, month, REFERENCE_YEAR, month, "relative", raw_text)
+    bare_month = re.fullmatch(r"(\d{1,2})月(?:份)?", text)
+    if bare_month:
+        month = int(bare_month.group(1))
+        if 1 <= month <= 12:
+            return _period(REFERENCE_YEAR, month, REFERENCE_YEAR, month, "relative", raw_text)
+    last_year_month = re.fullmatch(r"去年\s*(\d{1,2})月(?:份)?", text)
+    if last_year_month:
+        month = int(last_year_month.group(1))
+        if 1 <= month <= 12:
+            return _period(REFERENCE_YEAR - 1, month, REFERENCE_YEAR - 1, month, "relative", raw_text)
+    if reference_month is None:
+        return None
     if text == "上个月":
         year, month = _add_months(reference_month.year, reference_month.month, -1)
         return _period(year, month, year, month, "relative", raw_text)
     if text == "本月":
         return _period(reference_month.year, reference_month.month, reference_month.year, reference_month.month, "relative", raw_text)
-    if text == "今年3月":
-        return _period(reference_month.year, 3, reference_month.year, 3, "relative", raw_text)
-    this_year_month = re.fullmatch(r"今年\s*(\d{1,2})月", text)
-    if this_year_month:
-        month = int(this_year_month.group(1))
-        if 1 <= month <= 12:
-            return _period(reference_month.year, month, reference_month.year, month, "relative", raw_text)
     if text == "上季度":
         quarter = ((reference_month.month - 1) // 3) + 1
         year = reference_month.year
@@ -282,7 +367,7 @@ def _determine_overdue(
 
 
 def _period_overdue_status(periods: list[NormalizedPeriod], reference_month: ReferenceMonth | None) -> str:
-    if not periods or reference_month is None:
+    if not periods:
         return "unknown"
     comparable = [period for period in periods if period.reliable]
     if not comparable:
@@ -296,7 +381,11 @@ def _period_overdue_status(periods: list[NormalizedPeriod], reference_month: Ref
         end_month = int(period.end_month)
         if end_year <= 2025:
             statuses.append("overdue")
-        elif end_year == 2026 and end_month < reference_month.month:
+        elif (
+            end_year == REFERENCE_YEAR
+            and reference_month is not None
+            and end_month < reference_month.month
+        ):
             statuses.append("overdue")
         else:
             statuses.append("unknown")
@@ -305,16 +394,112 @@ def _period_overdue_status(periods: list[NormalizedPeriod], reference_month: Ref
     return "unknown"
 
 
-def _period(start_year: int, start_month: int, end_year: int, end_month: int, granularity: str, raw_text: str) -> NormalizedPeriod:
+def _period(
+    start_year: int,
+    start_month: int,
+    end_year: int,
+    end_month: int,
+    granularity: str,
+    raw_text: str,
+    *,
+    start_day: int | None = None,
+    end_day: int | None = None,
+) -> NormalizedPeriod:
+    start = f"{start_year}年{start_month}月" + (f"{start_day}日" if start_day else "")
+    end = f"{end_year}年{end_month}月" + (f"{end_day}日" if end_day else "")
+    if start_year == end_year and start_month == end_month and start_day == end_day:
+        text = start
+    elif granularity == "year" and start_year == end_year:
+        text = f"{start_year}年"
+    else:
+        text = f"{start}至{end}"
     return NormalizedPeriod(
-        text=f"{start_year}年{start_month}月到{end_year}年{end_month}月",
+        text=text,
         start_year=start_year,
         start_month=start_month,
+        start_day=start_day,
         end_year=end_year,
         end_month=end_month,
+        end_day=end_day,
         granularity=granularity,
         reliable=True,
         raw_text=raw_text,
+    )
+
+
+def _normalize_spoken_years(text: str) -> str:
+    replacements = {
+        "二零二四年": "2024年",
+        "二〇二四年": "2024年",
+        "二四年": "2024年",
+        "二零二五年": "2025年",
+        "二〇二五年": "2025年",
+        "二五年": "2025年",
+        "二零二六年": "2026年",
+        "二〇二六年": "2026年",
+        "二六年": "2026年",
+    }
+    for spoken, normalized in replacements.items():
+        text = text.replace(spoken, normalized)
+    return re.sub(
+        r"(?<!\d)(2[0-6])年",
+        lambda match: f"20{match.group(1)}年",
+        text,
+    )
+
+
+def _compact_periods(periods: list[NormalizedPeriod]) -> list[NormalizedPeriod]:
+    deduped: list[NormalizedPeriod] = []
+    for period in periods:
+        same_span = next((
+            existing
+            for existing in deduped
+            if _period_span(existing) == _period_span(period)
+        ), None)
+        if same_span is None:
+            deduped.append(period)
+
+    result: list[NormalizedPeriod] = []
+    for period in deduped:
+        span = _period_span(period)
+        contained = any(
+            other is not period
+            and _period_span(other) != span
+            and period.granularity in {"month", "single_month", "relative"}
+            and other.granularity in {"month_range", "date_range"}
+            and _span_contains(_period_span(other), span)
+            for other in deduped
+        )
+        if not contained:
+            result.append(period)
+    return result
+
+
+def _period_span(period: NormalizedPeriod) -> tuple[int, int, int, int, int, int]:
+    return (
+        period.start_year or 0,
+        period.start_month or 0,
+        period.start_day or 0,
+        period.end_year or 0,
+        period.end_month or 0,
+        period.end_day or 31,
+    )
+
+
+def _span_contains(
+    outer: tuple[int, int, int, int, int, int],
+    inner: tuple[int, int, int, int, int, int],
+) -> bool:
+    return outer[:3] <= inner[:3] and outer[3:] >= inner[3:]
+
+
+def _review_duplicates_period(review: str, periods: list[NormalizedPeriod]) -> bool:
+    raw = review.removeprefix("所属期无法规范化：")
+    normalized_raw = _normalize_spoken_years(raw)
+    return any(
+        str(period.start_year) in normalized_raw
+        and (period.start_month is None or f"{period.start_month}月" in normalized_raw)
+        for period in periods
     )
 
 

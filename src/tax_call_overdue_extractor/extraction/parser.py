@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from tax_call_overdue_extractor.exceptions import ResponseParseError
 
 from .normalization import normalize_enterprise_name_candidate
-from .schemas import ExtractionResult
+from .schemas import ExtractionResult, STANDARD_TAX_TYPES
 
 
 ALLOWED_SOURCE_NAMES = (
@@ -24,7 +24,7 @@ SOURCE_PRIORITY = ("业务内容", "答复内容", "电话录音转文本内容"
 EVIDENCE_FIELDS = ("enterprise_evidence", "tax_evidence", "overdue_evidence")
 STRING_EVIDENCE_REASON = "模型返回字符串形式证据，但无法在三个允许输入字段中唯一定位原文来源"
 INVALID_EVIDENCE_REASON = "模型返回的证据对象无法在指定输入字段中定位原文"
-PROCESS_WORDS = ("退税", "退个税", "申请", "流程", "审核", "审批", "工单", "任务", "作废", "超时")
+PROCESS_WORDS = ("退个税", "申请", "流程", "审核", "审批", "工单", "任务", "作废", "超时")
 TAX_OVERDUE_PATTERNS = (
     r"税款.{0,12}逾期",
     r"逾期.{0,12}(?:缴纳|申报)",
@@ -75,6 +75,7 @@ def preprocess_response_payload(
     items = normalized.get("items")
     if not isinstance(items, list):
         return normalized
+    explicit_tax_types = find_explicit_tax_types(texts)
 
     kept_items: list[Any] = []
     top_notes = _reason_list(normalized.get("review_reasons"))
@@ -105,6 +106,15 @@ def preprocess_response_payload(
                 item["enterprise_evidence"] = []
             else:
                 item["enterprise_name"] = cleaned_enterprise
+        if explicit_tax_types:
+            item["tax_types"] = list(dict.fromkeys([
+                *_string_list(item.get("tax_types")),
+                *explicit_tax_types,
+            ]))
+            item["tax_type_raw"] = list(dict.fromkeys([
+                *_string_list(item.get("tax_type_raw")),
+                *explicit_tax_types,
+            ]))
         for field in EVIDENCE_FIELDS:
             item[field] = _repair_evidence_list(item.get(field, []), texts, notes)
         for child_field in ("periods", "amounts"):
@@ -222,6 +232,28 @@ def find_high_confidence_enterprise(
             if name is not None:
                 return name, source, name
     return None
+
+
+def find_explicit_tax_types(source_texts: dict[str, str | None]) -> list[str]:
+    """补齐原文中明确出现的税种；语义映射仍由模型精度复核负责。"""
+
+    text = " ".join(source_texts.get(source) or "" for source in SOURCE_PRIORITY)
+    aliases = (
+        ("出口退（免）税", "进出口税"),
+        ("出口退免税", "进出口税"),
+        ("出口退税", "进出口税"),
+        ("社会保险费", "社保费"),
+        ("社保", "社保费"),
+        ("个税", "个人所得税"),
+        ("城建税", "城市建设维护税"),
+    )
+    found = [mapped for phrase, mapped in aliases if phrase in text]
+    found.extend(
+        tax_type
+        for tax_type in STANDARD_TAX_TYPES
+        if tax_type not in {"其他", "未识别"} and tax_type in text
+    )
+    return list(dict.fromkeys(found))
 
 
 def _enterprise_only_item(name: str, source: str, quote: str) -> dict[str, Any]:
@@ -502,8 +534,10 @@ def _normalize_periods(periods: Any, fallback_evidence: list[dict[str, Any]]) ->
                 "period_type": period_type,
                 "start_year": _safe_int(period.get("start_year")),
                 "start_month": _safe_month(period.get("start_month")),
+                "start_day": _safe_day(period.get("start_day")),
                 "end_year": _safe_int(period.get("end_year")),
                 "end_month": _safe_month(period.get("end_month")),
+                "end_day": _safe_day(period.get("end_day")),
                 "relative_expression": _optional_string(period.get("relative_expression")),
                 "evidence": period.get("evidence") or fallback_evidence,
             })
@@ -554,17 +588,29 @@ def _valid_evidence_list(value: Any) -> list[dict[str, Any]]:
 
 
 def _normalize_tax_types(values: list[str], raw_values: list[str]) -> list[str]:
-    aliases = {"个税": "个人所得税", "城建税": "城市建设维护税", "企业所的税": "企业所得税"}
+    aliases = {
+        "个税": "个人所得税",
+        "城建税": "城市建设维护税",
+        "企业所的税": "企业所得税",
+        "社保": "社保费",
+        "社会保险费": "社保费",
+        "出口退税": "进出口税",
+    }
     normalized: list[str] = []
     for value in [*values, *raw_values]:
         mapped = aliases.get(value, value)
         if mapped in {
             "增值税", "个人所得税", "企业所得税", "消费税", "印花税", "城镇土地使用税",
             "车辆购置税", "城市建设维护税", "契税", "房产税", "车船税", "耕地占用税",
-            "资源税", "环境保护税", "烟叶税", "进出口税", "残保金", "非税收入", "其他", "未识别",
-        } and mapped not in normalized:
-            normalized.append(mapped)
-    return normalized or (["未识别"] if raw_values else [])
+            "资源税", "环境保护税", "烟叶税", "进出口税", "社保费", "残保金", "非税收入", "其他", "未识别",
+        }:
+            if mapped not in normalized:
+                normalized.append(mapped)
+        elif value.strip() and "其他" not in normalized:
+            normalized.append("其他")
+    if len(normalized) > 1 and "未识别" in normalized:
+        normalized.remove("未识别")
+    return normalized
 
 
 def _normalize_conflicts(value: Any) -> list[dict[str, Any]]:
@@ -658,6 +704,11 @@ def _safe_int(value: Any) -> int | None:
 def _safe_month(value: Any) -> int | None:
     parsed = _safe_int(value)
     return parsed if parsed is not None and 1 <= parsed <= 12 else None
+
+
+def _safe_day(value: Any) -> int | None:
+    parsed = _safe_int(value)
+    return parsed if parsed is not None and 1 <= parsed <= 31 else None
 
 
 def _period_from_parts(period: dict[str, Any]) -> str | None:

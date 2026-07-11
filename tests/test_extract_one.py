@@ -185,7 +185,7 @@ def test_extract_one_success_with_mock_client(tmp_path: Path) -> None:
         overwrite=False,
     )
 
-    assert client.calls == 1
+    assert client.calls == 2
     assert result.called_api is True
     assert result.item_count == 1
     data = json.loads(output.read_text(encoding="utf-8"))

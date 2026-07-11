@@ -158,9 +158,22 @@ class RoutingClient:
         assert set(data.keys()) == {"电话录音转文本内容", "业务内容", "答复内容"}
         self.calls.append(data)
         business = data["业务内容"] or ""
+        if "第二次精度复核" in request.messages[0]["content"]:
+            names = [name for name in ("甲企业", "乙企业") if name in business]
+            if not names and business:
+                names = [business.split()[0]]
+            return LLMResponse(content=json.dumps({
+                "enterprises": [
+                    {"name": name, "source": "业务内容", "quote": name, "confidence": "high"}
+                    for name in names
+                ],
+                "tax_types": [],
+                "periods": [],
+                "explicitly_overdue": None,
+            }, ensure_ascii=False))
         if self.mode == "fail_one" and "企业2" in business:
             raise FakeLLMError("sanitized api failure")
-        if self.mode == "multi" and "企业1" in business:
+        if self.mode == "multi":
             return LLMResponse(content=json.dumps({
                 "schema_version": "1.0",
                 "has_relevant_information": True,
@@ -195,7 +208,7 @@ def test_50_rows_batch_processing_and_outputs(tmp_path: Path) -> None:
         BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
     )
 
-    assert len(client.calls) == 50
+    assert len(client.calls) == 100
     assert summary.success_count == 50
     assert summary.output_path.exists()
     assert summary.conflicts_output_path.exists()
@@ -204,6 +217,7 @@ def test_50_rows_batch_processing_and_outputs(tmp_path: Path) -> None:
     raw_rows = list(settings.paths.state_dir.glob("runs/*/row_*/response.txt"))
     assert len(run_rows) == 50
     assert len(raw_rows) == 50
+    assert len(list(settings.paths.state_dir.glob("runs/*/row_*/precision_review.txt"))) == 50
     assert not (settings.paths.state_dir / "raw").exists()
     assert not (settings.paths.state_dir / "structured").exists()
     wb = load_workbook(summary.output_path)
@@ -212,7 +226,7 @@ def test_50_rows_batch_processing_and_outputs(tmp_path: Path) -> None:
         assert ws.max_row == 51
         assert ws.cell(row=2, column=12).value == "企业1"
         assert ws.cell(row=2, column=13).value == "增值税；城市建设维护税"
-        assert ws.cell(row=2, column=14).value == "2025年5月到2025年5月"
+        assert ws.cell(row=2, column=14).value == "2025年5月"
         assert ws.cell(row=2, column=16).value == "已逾期"
         assert ws.cell(row=2, column=17).value
         assert ws.cell(row=1, column=17).value == "说明"
@@ -232,7 +246,7 @@ def test_single_allowed_field_calls_model_and_blank_row_skips(tmp_path: Path) ->
         BatchOptions(input_path=source, execute=True, overwrite=True)
     )
 
-    assert len(client.calls) == 2
+    assert len(client.calls) == 4
     assert summary.skipped_count == 1
     wb = load_workbook(summary.output_path)
     try:
@@ -269,7 +283,7 @@ def test_resume_reuses_success_and_reprocesses_changed_input_or_prompt(tmp_path:
     first_client = RoutingClient()
     service = BatchExtractionService(settings, llm_client=first_client, system_prompt="prompt-v1")
     service.run(BatchOptions(input_path=source, execute=True, overwrite=True, resume=True))
-    assert len(first_client.calls) == 2
+    assert len(first_client.calls) == 4
 
     second_client = RoutingClient()
     BatchExtractionService(settings, llm_client=second_client, system_prompt="prompt-v1").run(
@@ -281,7 +295,7 @@ def test_resume_reuses_success_and_reprocesses_changed_input_or_prompt(tmp_path:
     BatchExtractionService(settings, llm_client=third_client, system_prompt="prompt-v2").run(
         BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
     )
-    assert len(third_client.calls) == 2
+    assert len(third_client.calls) == 4
 
     wb = load_workbook(source)
     try:
@@ -293,7 +307,7 @@ def test_resume_reuses_success_and_reprocesses_changed_input_or_prompt(tmp_path:
     BatchExtractionService(settings, llm_client=fourth_client, system_prompt="prompt-v2").run(
         BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
     )
-    assert len(fourth_client.calls) == 1
+    assert len(fourth_client.calls) == 2
 
 
 def test_resume_reprocesses_when_cached_result_file_is_missing(tmp_path: Path) -> None:
@@ -304,7 +318,7 @@ def test_resume_reprocesses_when_cached_result_file_is_missing(tmp_path: Path) -
     BatchExtractionService(settings, llm_client=first, system_prompt="same-prompt").run(
         BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
     )
-    assert len(first.calls) == 1
+    assert len(first.calls) == 2
     result_file = next(settings.paths.state_dir.glob("runs/*/row_*/result.json"))
     result_file.unlink()
 
@@ -313,13 +327,19 @@ def test_resume_reprocesses_when_cached_result_file_is_missing(tmp_path: Path) -
         BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
     )
 
-    assert len(second.calls) == 1
+    assert len(second.calls) == 2
 
 
 def test_multi_items_are_merged_without_changing_original_rows(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     source = settings.paths.samples_dir / "sample.xlsx"
     create_batch_workbook(source, 2)
+    workbook = load_workbook(source)
+    try:
+        workbook.active.cell(row=2, column=10).value = "甲企业 乙企业 2025年5月 增值税"
+        workbook.save(source)
+    finally:
+        workbook.close()
     client = RoutingClient(mode="multi")
 
     summary = BatchExtractionService(settings, llm_client=client).run(
@@ -332,7 +352,7 @@ def test_multi_items_are_merged_without_changing_original_rows(tmp_path: Path) -
         assert ws.max_row == 3
         assert ws.cell(row=2, column=12).value == "甲企业；乙企业"
         assert ws.cell(row=2, column=13).value == "增值税；企业所得税"
-        assert ws.cell(row=2, column=14).value == "2025年5月到2025年5月；2025年6月到2025年6月"
+        assert ws.cell(row=2, column=14).value == "2025年5月；2025年6月"
         assert ws.cell(row=3, column=1).value == 2
     finally:
         wb.close()
@@ -353,7 +373,7 @@ def test_period_normalization_and_overdue_rules() -> None:
         }
     ]))
     item = normalize_extraction_result(result, reference_month=reference)[0]
-    assert item.periods_text == "2025年12月到2025年12月"
+    assert item.periods_text == "2025年12月"
     assert item.overdue_text == "已逾期"
 
     equal = normalize_extraction_result(parse_extraction_response(extraction_json(periods=[period(2026, 1)])), reference_month=reference)[0]
@@ -370,7 +390,7 @@ def test_period_normalization_and_overdue_rules() -> None:
     }])), reference_month=reference)[0]
     assert equal.overdue_text is None
     assert future.overdue_text is None
-    assert year.periods_text == "2025年1月到2025年12月"
+    assert year.periods_text == "2025年"
     assert year.overdue_text == "已逾期"
 
 
@@ -430,7 +450,7 @@ def test_preflight_does_not_call_api_or_expose_text(tmp_path: Path, capsys) -> N
     create_batch_workbook(source, 3)
     plan = BatchExtractionService(settings, llm_client=RoutingClient()).preflight(BatchOptions(input_path=source))
 
-    assert plan.estimated_api_calls == 3
+    assert plan.estimated_api_calls == 6
     assert plan.eligible_rows == 3
     assert "企业1" not in capsys.readouterr().out
 

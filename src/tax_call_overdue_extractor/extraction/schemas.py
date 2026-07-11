@@ -25,6 +25,7 @@ STANDARD_TAX_TYPES: tuple[str, ...] = (
     "环境保护税",
     "烟叶税",
     "进出口税",
+    "社保费",
     "残保金",
     "非税收入",
     "其他",
@@ -90,8 +91,10 @@ class PeriodMention(StrictSchemaModel):
     period_type: PeriodType
     start_year: int | None = None
     start_month: int | None = Field(default=None, ge=1, le=12)
+    start_day: int | None = Field(default=None, ge=1, le=31)
     end_year: int | None = None
     end_month: int | None = Field(default=None, ge=1, le=12)
+    end_day: int | None = Field(default=None, ge=1, le=31)
     relative_expression: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
 

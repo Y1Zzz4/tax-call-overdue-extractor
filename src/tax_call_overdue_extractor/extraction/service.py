@@ -31,10 +31,10 @@ from tax_call_overdue_extractor.llm.request_builder import (
 )
 
 from .parser import parse_extraction_response
-from .enterprise_review import (
-    apply_enterprise_review,
-    load_enterprise_review_prompt,
-    parse_enterprise_review,
+from .precision_review import (
+    apply_precision_review,
+    load_precision_review_prompt,
+    parse_precision_review,
 )
 from .schemas import ExtractionResult, no_text_result
 
@@ -181,23 +181,23 @@ class SingleRecordExtractionService:
         response = client.complete(request)
         raw_response_path = _save_raw_response(self._settings.paths.state_dir, row_number, response.content)
         result = parse_extraction_response(response.content, dict(model_input.data))
-        enterprise_review_path: Path | None = None
+        precision_review_path: Path | None = None
         try:
-            enterprise_response = client.complete(
-                build_chat_request(load_enterprise_review_prompt(), model_input)
+            precision_response = client.complete(
+                build_chat_request(load_precision_review_prompt(), model_input)
             )
-            enterprise_review_path = _save_enterprise_review_response(
+            precision_review_path = _save_precision_review_response(
                 self._settings.paths.state_dir,
                 row_number,
-                enterprise_response.content,
+                precision_response.content,
             )
-            decisions = parse_enterprise_review(
-                enterprise_response.content,
+            precision_review = parse_precision_review(
+                precision_response.content,
                 model_input.data,
             )
-            result = apply_enterprise_review(result, decisions, model_input.data)
+            result = apply_precision_review(result, precision_review, model_input.data)
         except (ValueError, LLMClientError) as exc:
-            LOGGER.warning("企业名称复核失败，保留首次提取结果 row=%s error=%s", row_number, exc.__class__.__name__)
+            LOGGER.warning("精度复核失败，保留首次提取结果 row=%s error=%s", row_number, exc.__class__.__name__)
         _write_run_output(
             destination,
             status="success",
@@ -208,7 +208,7 @@ class SingleRecordExtractionService:
             model_input=model_input,
             result=result,
             raw_response_path=raw_response_path,
-            enterprise_review_path=enterprise_review_path,
+            precision_review_path=precision_review_path,
         )
         return _summary(row_number, "success", True, result, destination, started)
 
@@ -298,7 +298,7 @@ def _write_run_output(
     model_input: ModelInput,
     result: ExtractionResult | None,
     raw_response_path: Path | None,
-    enterprise_review_path: Path | None = None,
+    precision_review_path: Path | None = None,
     error_message: str | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -311,7 +311,7 @@ def _write_run_output(
         "input_total_chars": model_input.total_chars,
         "request_sha256": model_input.sha256,
         "raw_response_path": str(raw_response_path) if raw_response_path is not None else None,
-        "enterprise_review_path": str(enterprise_review_path) if enterprise_review_path is not None else None,
+        "precision_review_path": str(precision_review_path) if precision_review_path is not None else None,
         "error_message": error_message,
         "result": result.model_dump(mode="json") if result is not None else None,
     }
@@ -332,10 +332,10 @@ def _save_raw_response(state_dir: Path, row_number: int, content: str) -> Path:
     return path
 
 
-def _save_enterprise_review_response(state_dir: Path, row_number: int, content: str) -> Path:
+def _save_precision_review_response(state_dir: Path, row_number: int, content: str) -> Path:
     directory = state_dir / "preview" / f"row_{row_number:06d}"
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "enterprise_review.txt"
+    path = directory / "precision_review.txt"
     path.write_text(content, encoding="utf-8")
     return path
 
