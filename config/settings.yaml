@@ -20,7 +20,7 @@ logging:
 
 llm_reserved:
   interface: openai_compatible
-  max_concurrency: 4
+  max_concurrency: 2
   max_retries: 3
   timeout_seconds: 60
   max_input_chars: 12000

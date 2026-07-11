@@ -215,6 +215,65 @@ data/state/preview/row_<row-number>.json
 
 相关信息不要求原文已经明确逾期。只要三列中出现企业名称、明确企业简称、税种、所属期、涉税金额或明确期限状态中的任意一项，就应当返回 `has_relevant_information=true` 并至少生成一个 item。若只识别出企业名称，也允许 `tax_types`、`periods`、`amounts` 为空；是否逾期会在后续结合本地月份数据判断。
 
+## 批量提取样本
+
+批处理默认只预检，不调用 API：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-batch
+```
+
+只测试指定三行并真实调用：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-batch \
+  --rows 2,3,4 \
+  --execute \
+  --concurrency 1
+```
+
+处理 50 条样本并启用断点续跑：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-batch \
+  --execute \
+  --concurrency 2 \
+  --resume
+```
+
+中断后恢复使用同一命令：
+
+```bash
+python -m tax_call_overdue_extractor.cli extract-batch \
+  --execute \
+  --concurrency 2 \
+  --resume
+```
+
+样本阶段默认安全上限为 100 条。超过 100 条时，除非显式传入 `--allow-large-run`，否则拒绝执行真实调用。
+
+批处理输出位置：
+
+- 最终 Excel：`data/output/<原文件名>_extracted.xlsx`
+- 冲突清单：`data/conflicts/<原文件名>_conflicts.xlsx`
+- 人工复核清单：`data/output/<原文件名>_review.xlsx`
+- SQLite 状态库：`data/state/batch_state.sqlite3`
+- 原始模型响应：`data/state/raw/`
+- 结构化结果：`data/state/structured/`
+
+SQLite 断点续跑复用条件：
+
+- 同一工作表和原始 Excel 行号
+- 三列允许文本计算出的 `input_hash` 未变化
+- 系统提示词 `prompt_hash` 未变化
+- `schema_version` 未变化
+- 模型名称未变化
+- 上次状态属于已完成可复用状态
+
+状态库不保存三列完整原文。提示词、模型或该行输入变化后会重新调用模型。
+
+批处理本地标准化会写入最后五列：企业名称、逾期税种、所属期、涉及金额、是否确定已逾期。逾期列只会写入 `已逾期` 或保持空白。
+
 ## Excel 格式保留说明
 
 抽样不会用 pandas 重建工作簿。实现方式是先复制原始 `.xlsx` 到临时文件，再从下到上删除未抽中的数据行，随后更新自动筛选和 Excel 表格对象范围，保存并重新读取验证，最后原子移动到最终输出路径。
