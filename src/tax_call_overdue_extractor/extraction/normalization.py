@@ -11,6 +11,17 @@ from .schemas import Conflict, ExtractionItem, ExtractionResult, PeriodMention, 
 
 
 PRONOUN_ENTERPRISE_NAMES = {"我们公司", "我司", "本公司", "我们单位", "我公司", "本单位"}
+GENERIC_ENTERPRISE_FRAGMENTS = {
+    "这个公司",
+    "那个公司",
+    "一家公司",
+    "家公司",
+    "我们公司",
+    "我公司",
+    "本公司",
+    "所在公司",
+    "成立的公司",
+}
 CHINESE_SEMICOLON = "；"
 
 
@@ -98,10 +109,20 @@ def parse_reference_month(registration_date: object, month_value: object) -> Ref
 
 
 def _normalize_enterprise_name(value: str | None) -> str | None:
+    return normalize_enterprise_name_candidate(value)
+
+
+def normalize_enterprise_name_candidate(value: str | None) -> str | None:
+    """拒绝代称和口语短语，只保留具有实体名称形态的候选。"""
+
     if value is None:
         return None
-    text = value.strip()
+    text = value.strip(" \t\r\n，,。；;：:")
     if text == "" or text in PRONOUN_ENTERPRISE_NAMES:
+        return None
+    if any(fragment in text for fragment in GENERIC_ENTERPRISE_FRAGMENTS):
+        return None
+    if text.startswith(("因为", "所以", "然后", "现在", "目前", "我们", "这个", "那个")):
         return None
     return text
 
@@ -263,28 +284,25 @@ def _determine_overdue(
 def _period_overdue_status(periods: list[NormalizedPeriod], reference_month: ReferenceMonth | None) -> str:
     if not periods or reference_month is None:
         return "unknown"
-    comparable = [period for period in periods if period.reliable and period.granularity != "year"]
+    comparable = [period for period in periods if period.reliable]
     if not comparable:
         return "unknown"
     statuses: list[str] = []
-    ref_key = reference_month.year * 12 + reference_month.month
     for period in comparable:
         if None in {period.start_year, period.start_month, period.end_year, period.end_month}:
             statuses.append("unknown")
             continue
-        start_key = int(period.start_year) * 12 + int(period.start_month)
-        end_key = int(period.end_year) * 12 + int(period.end_month)
-        if end_key < ref_key:
+        end_year = int(period.end_year)
+        end_month = int(period.end_month)
+        if end_year <= 2025:
             statuses.append("overdue")
-        elif start_key <= ref_key <= end_key:
-            statuses.append("current_or_cross")
+        elif end_year == 2026 and end_month < reference_month.month:
+            statuses.append("overdue")
         else:
-            statuses.append("future")
-    if statuses and all(status == "overdue" for status in statuses):
+            statuses.append("unknown")
+    if "overdue" in statuses:
         return "overdue"
-    if "overdue" in statuses and any(status in {"current_or_cross", "future"} for status in statuses):
-        return "mixed"
-    return "not_overdue"
+    return "unknown"
 
 
 def _period(start_year: int, start_month: int, end_year: int, end_month: int, granularity: str, raw_text: str) -> NormalizedPeriod:
@@ -330,6 +348,16 @@ def _month_from_value(value: object) -> int | None:
     if value is None:
         return None
     text = str(value)
+    if text.lstrip().startswith("="):
+        return None
+    iso_date = re.match(r"^\s*\d{4}[-/]([01]?\d)(?:[-/]\d{1,2})?\s*$", text)
+    if iso_date:
+        month = int(iso_date.group(1))
+        return month if 1 <= month <= 12 else None
+    chinese_date = re.search(r"\d{4}年\s*(\d{1,2})月", text)
+    if chinese_date:
+        month = int(chinese_date.group(1))
+        return month if 1 <= month <= 12 else None
     match = re.search(r"(?:^|[^\d])(\d{1,2})(?:月|$)", text)
     if not match:
         parts = re.findall(r"\d{1,2}", text)

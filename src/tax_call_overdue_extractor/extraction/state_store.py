@@ -68,9 +68,13 @@ class BatchStateStore:
         ).fetchone()
         if row is None or row["status"] not in REUSABLE_STATUSES:
             return None
+        structured_path = Path(row["structured_result_path"]) if row["structured_result_path"] else None
+        if row["status"] in {"success", "conflict", "needs_review", "skipped_no_text"}:
+            if structured_path is None or not structured_path.exists():
+                return None
         return StateRecord(
             status=row["status"],
-            structured_result_path=Path(row["structured_result_path"]) if row["structured_result_path"] else None,
+            structured_result_path=structured_path,
             raw_response_path=Path(row["raw_response_path"]) if row["raw_response_path"] else None,
             attempts=int(row["attempts"]),
         )

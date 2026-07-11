@@ -12,6 +12,7 @@ from pathlib import Path
 from zipfile import BadZipFile
 
 from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.worksheet import Worksheet
@@ -153,12 +154,18 @@ def create_sample_workbook(
         workbook = _load_workbook(temp_path, "读取临时工作簿")
         try:
             worksheet = _select_worksheet(workbook, sheet_name, use_active_sheet)
-            validate_header(worksheet, header_row)
+            header = validate_header(worksheet, header_row)
 
             selected_set = set(selected_rows)
             header_dimension = _capture_row_dimension(worksheet, header_row)
             selected_dimensions = {
                 row_index: _capture_row_dimension(worksheet, row_index) for row_index in selected_rows
+            }
+            month_column = header.index("月份") + 1
+            selected_month_formulas = {
+                row_index: worksheet.cell(row=row_index, column=month_column).value
+                for row_index in selected_rows
+                if worksheet.cell(row=row_index, column=month_column).data_type == "f"
             }
 
             for row_index in range(worksheet.max_row, header_row, -1):
@@ -166,7 +173,17 @@ def create_sample_workbook(
                     worksheet.delete_rows(row_index)
 
             _restore_row_dimensions(worksheet, header_row, header_dimension, selected_rows, selected_dimensions)
+            _translate_sample_month_formulas(
+                worksheet,
+                header_row=header_row,
+                month_column=month_column,
+                selected_rows=selected_rows,
+                source_formulas=selected_month_formulas,
+            )
             _update_filter_and_tables(worksheet, header_row, len(selected_rows))
+            worksheet.parent.calculation.calcMode = "auto"
+            worksheet.parent.calculation.fullCalcOnLoad = True
+            worksheet.parent.calculation.forceFullCalc = True
             workbook.save(temp_path)
         finally:
             workbook.close()
@@ -233,7 +250,12 @@ def validate_sample_output(
             for column in range(1, len(EXPECTED_COLUMNS) + 1):
                 source_cell = source_sheet.cell(row=source_row, column=column)
                 output_cell = output_sheet.cell(row=output_row, column=column)
-                if not _cell_values_equivalent(source_cell.value, output_cell.value):
+                if source_header[column - 1] == "月份":
+                    _validate_sample_month_cell(source_cell, output_cell)
+                    values_equivalent = True
+                else:
+                    values_equivalent = _cell_values_equivalent(source_cell.value, output_cell.value)
+                if not values_equivalent:
                     raise OutputValidationError(
                         _cell_value_mismatch_message(
                             column_name=source_header[column - 1],
@@ -360,6 +382,46 @@ def _restore_row_dimensions(
         snapshot = selected_dimensions.get(source_row)
         if snapshot is not None:
             _apply_row_dimension(worksheet, header_row + offset, snapshot)
+
+
+def _translate_sample_month_formulas(
+    worksheet: Worksheet,
+    *,
+    header_row: int,
+    month_column: int,
+    selected_rows: tuple[int, ...],
+    source_formulas: dict[int, object],
+) -> None:
+    """把抽中行的月份公式从原行坐标平移到样本当前行坐标。"""
+
+    column_letter = get_column_letter(month_column)
+    for offset, source_row in enumerate(selected_rows, start=1):
+        formula = source_formulas.get(source_row)
+        if not isinstance(formula, str):
+            continue
+        output_row = header_row + offset
+        origin = f"{column_letter}{source_row}"
+        destination = f"{column_letter}{output_row}"
+        worksheet.cell(row=output_row, column=month_column).value = Translator(
+            formula,
+            origin=origin,
+        ).translate_formula(destination)
+
+
+def _validate_sample_month_cell(source_cell, output_cell) -> None:
+    if source_cell.data_type == "f" and isinstance(source_cell.value, str):
+        expected_value = Translator(
+            source_cell.value,
+            origin=source_cell.coordinate,
+        ).translate_formula(output_cell.coordinate)
+    else:
+        expected_value = source_cell.value
+    if (
+        output_cell.value != expected_value
+        or output_cell.data_type != source_cell.data_type
+        or output_cell.number_format != source_cell.number_format
+    ):
+        raise OutputValidationError("抽样月份公式未指向当前行，或月份单元格类型/格式发生变化")
 
 
 def _apply_row_dimension(

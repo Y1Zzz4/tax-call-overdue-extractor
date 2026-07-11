@@ -300,9 +300,9 @@ def _write_run_output(
 
 
 def _save_raw_response(state_dir: Path, row_number: int, content: str) -> Path:
-    raw_dir = state_dir / "raw"
+    raw_dir = state_dir / "preview" / f"row_{row_number:06d}"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    path = raw_dir / f"row_{row_number}_{uuid.uuid4().hex}.txt"
+    path = raw_dir / "response.txt"
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -310,7 +310,7 @@ def _save_raw_response(state_dir: Path, row_number: int, content: str) -> Path:
 def _default_output_path(state_dir: Path, row_number: int, output_path: str | Path | None) -> Path:
     if output_path is not None:
         return Path(output_path)
-    return state_dir / "preview" / f"row_{row_number}.json"
+    return state_dir / "preview" / f"row_{row_number:06d}" / "result.json"
 
 
 def _validate_output_path(output_path: Path, overwrite: bool) -> None:

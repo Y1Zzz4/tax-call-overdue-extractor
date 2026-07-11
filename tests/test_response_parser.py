@@ -395,6 +395,66 @@ def test_row_2_refund_workflow_is_not_tax_overdue_or_tax_period() -> None:
 
     result = parse_extraction_response(json.dumps(payload, ensure_ascii=False), source_texts)
 
+    assert result.has_relevant_information is True
+    assert len(result.items) == 1
+    assert result.items[0].enterprise_name == "重庆海尔家电销售有限公司上海分公司"
+    assert result.items[0].explicitly_overdue is None
+    assert all("2026年2月" not in period.raw_text for item in result.items for period in item.periods)
+
+
+@pytest.mark.parametrize(
+    ("business_content", "expected_name"),
+    [
+        (
+            "ED:91310115MA1HBJ4F4P-上海昊源化工有限公司5月25日申请的分配额度流程逾期？",
+            "上海昊源化工有限公司",
+        ),
+        (
+            "【相关工单】咨询税务注销调查巡查问题\n"
+            "企业：91310120MA7BYN7TXE 上海凯捷特精密机械制造有限公司\n"
+            "内容：调查巡查派发及结果录入流程逾期",
+            "上海凯捷特精密机械制造有限公司",
+        ),
+    ],
+)
+def test_business_content_enterprise_fallback_even_for_process_only_record(
+    business_content: str,
+    expected_name: str,
+) -> None:
+    raw = json.dumps(minimal_result(), ensure_ascii=False)
+    result = parse_extraction_response(
+        raw,
+        {
+            "业务内容": business_content,
+            "答复内容": None,
+            "电话录音转文本内容": None,
+        },
+    )
+
+    assert result.has_relevant_information is True
+    assert len(result.items) == 1
+    assert result.items[0].enterprise_name == expected_name
+    assert result.items[0].explicitly_overdue is None
+    assert result.needs_review is False
+
+
+@pytest.mark.parametrize(
+    "generic_phrase",
+    ["因为这个公司", "我们现在上海成立的家公司", "那个公司", "一家公司"],
+)
+def test_generic_company_phrases_are_not_enterprise_names(generic_phrase: str) -> None:
+    item = base_item()
+    item["enterprise_name"] = generic_phrase
+    payload = relevant_result_with_item(item)
+
+    result = parse_extraction_response(
+        json.dumps(payload, ensure_ascii=False),
+        {
+            "业务内容": generic_phrase,
+            "答复内容": None,
+            "电话录音转文本内容": None,
+        },
+    )
+
     assert result.has_relevant_information is False
     assert result.items == []
-    assert all("2026年2月" not in period.raw_text for item in result.items for period in item.periods)

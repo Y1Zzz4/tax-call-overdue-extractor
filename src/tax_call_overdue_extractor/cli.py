@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser = subparsers.add_parser("extract-one", help="对单条 Excel 记录执行结构化提取")
     extract_parser.add_argument("--input", type=Path, help="输入 .xlsx 文件路径；默认读取 data/samples 下唯一文件")
     extract_parser.add_argument("--row-number", type=int, default=2, help="Excel 工作表实际行号，默认 2")
-    extract_parser.add_argument("--output", type=Path, help="输出 JSON 路径，默认 data/state/preview/row_<row>.json")
+    extract_parser.add_argument("--output", type=Path, help="输出 JSON 路径，默认 data/state/preview/row_<行号>/result.json")
     extract_parser.add_argument("--sheet", help="工作表名称；不传时按配置使用活动工作表")
     extract_parser.add_argument("--dry-run", action="store_true", help="只构建请求摘要，不调用 API")
     extract_parser.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出 JSON")

@@ -17,7 +17,6 @@ from typing import Sequence
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 
 from tax_call_overdue_extractor.config import ProjectSettings
 from tax_call_overdue_extractor.excel_io import CALL_TEXT_COLUMN, EXPECTED_COLUMNS, hash_file, validate_header
@@ -43,7 +42,6 @@ RESULT_COLUMNS = {
     "是否确定已逾期": 16,
     "说明": 17,
 }
-OUTPUT_COLUMN_COUNT = 17
 UNKNOWN_ENTERPRISE = "未识别"
 UNKNOWN_TAX = "未识别"
 UNKNOWN_PERIOD = "未识别"
@@ -165,6 +163,7 @@ class BatchExtractionService:
 
         client = self._llm_client or OpenAICompatibleLLMClient(self._settings.llm)
         store = BatchStateStore(plan.state_db_path)
+        run_id = _new_run_id()
         try:
             outcomes = asyncio.run(
                 self._run_async(
@@ -175,6 +174,7 @@ class BatchExtractionService:
                     source_fingerprint=source_fingerprint,
                     prompt_hash=prompt_hash,
                     resume=options.resume,
+                    run_id=run_id,
                 )
             )
         finally:
@@ -202,6 +202,7 @@ class BatchExtractionService:
         source_fingerprint: str,
         prompt_hash: str,
         resume: bool,
+        run_id: str,
     ) -> list[RowBatchOutcome]:
         semaphore = asyncio.Semaphore(plan.concurrency)
         tasks = [
@@ -213,6 +214,7 @@ class BatchExtractionService:
                 source_fingerprint=source_fingerprint,
                 prompt_hash=prompt_hash,
                 resume=resume,
+                run_id=run_id,
                 semaphore=semaphore,
             )
             for record in records
@@ -230,6 +232,7 @@ class BatchExtractionService:
         source_fingerprint: str,
         prompt_hash: str,
         resume: bool,
+        run_id: str,
         semaphore: asyncio.Semaphore,
     ) -> RowBatchOutcome:
         reusable = None
@@ -248,7 +251,7 @@ class BatchExtractionService:
 
         if not record.model_input.has_any_text:
             result = no_text_result()
-            path = _save_structured_result(self._settings.paths.state_dir, record.original_row_number, result, "skipped_no_text")
+            path = _save_structured_result(self._settings.paths.state_dir, run_id, record.original_row_number, result, "skipped_no_text")
             store.upsert(
                 source_file_fingerprint=source_fingerprint,
                 worksheet=plan.sheet_name,
@@ -301,11 +304,11 @@ class BatchExtractionService:
                     response = client.complete(request)
                 else:
                     response = await asyncio.to_thread(client.complete, request)
-                raw_path = _save_raw_response(self._settings.paths.state_dir, record.original_row_number, response.content)
+                raw_path = _save_raw_response(self._settings.paths.state_dir, run_id, record.original_row_number, response.content)
                 result = parse_extraction_response(response.content, dict(record.model_input.data))
                 normalized = normalize_extraction_result(result, reference_month=record.reference_month)
                 status = _status_for_result(result, normalized)
-                structured_path = _save_structured_result(self._settings.paths.state_dir, record.original_row_number, result, status)
+                structured_path = _save_structured_result(self._settings.paths.state_dir, run_id, record.original_row_number, result, status)
                 store.upsert(
                     source_file_fingerprint=source_fingerprint,
                     worksheet=plan.sheet_name,
@@ -432,7 +435,6 @@ def write_outputs(
             worksheet = workbook[sheet_name]
             validate_header(worksheet, header_row)
             _write_result_rows(worksheet, outcomes, header_row)
-            _update_ranges(worksheet)
             workbook.save(temp_path)
         finally:
             workbook.close()
@@ -456,21 +458,10 @@ def _write_result_rows(worksheet, outcomes: list[RowBatchOutcome], header_row: i
     explanation_header.fill = copy(source_header.fill)
     explanation_header.border = copy(source_header.border)
     explanation_header.alignment = copy(source_header.alignment)
-    outcome_map = {outcome.record.original_row_number: outcome for outcome in outcomes}
-    for row_number in sorted(outcome_map.keys(), reverse=True):
-        outcome = outcome_map[row_number]
-        items = outcome.normalized_items
-        extra = max(0, len(items) - 1)
-        if extra:
-            worksheet.insert_rows(row_number + 1, extra)
-            for offset in range(1, extra + 1):
-                _copy_row_style(worksheet, row_number, row_number + offset)
-                for col in range(1, 12):
-                    worksheet.cell(row=row_number + offset, column=col).value = None
-        if items:
-            _write_item(worksheet, row_number, items[0])
-            for offset, item in enumerate(items[1:], start=1):
-                _write_item(worksheet, row_number + offset, item)
+    for outcome in sorted(outcomes, key=lambda value: value.record.original_row_number):
+        row_number = outcome.record.original_row_number
+        if outcome.normalized_items:
+            _write_item(worksheet, row_number, _merge_normalized_items(outcome.normalized_items))
         else:
             _write_empty_outcome(worksheet, row_number, outcome)
 
@@ -499,28 +490,33 @@ def _write_empty_outcome(worksheet, row_number: int, outcome: RowBatchOutcome) -
     )
 
 
-def _copy_row_style(worksheet, source_row: int, target_row: int) -> None:
-    worksheet.row_dimensions[target_row].height = worksheet.row_dimensions[source_row].height
-    worksheet.row_dimensions[target_row].hidden = worksheet.row_dimensions[source_row].hidden
-    for column in range(1, worksheet.max_column + 1):
-        source = worksheet.cell(row=source_row, column=column)
-        target = worksheet.cell(row=target_row, column=column)
-        target.font = copy(source.font)
-        target.fill = copy(source.fill)
-        target.border = copy(source.border)
-        target.alignment = copy(source.alignment)
-        target.number_format = source.number_format
-        target.protection = copy(source.protection)
+def _merge_normalized_items(items: list[NormalizedItem]) -> NormalizedItem:
+    def merge_text(values: list[str | None]) -> str | None:
+        parts: list[str] = []
+        for value in values:
+            if value:
+                parts.extend(part for part in value.split("；") if part)
+        unique = list(dict.fromkeys(parts))
+        return "；".join(unique) if unique else None
 
-
-def _update_ranges(worksheet) -> None:
-    ref = f"A1:{get_column_letter(OUTPUT_COLUMN_COUNT)}{worksheet.max_row}"
-    if worksheet.auto_filter and worksheet.auto_filter.ref:
-        worksheet.auto_filter.ref = ref
-    for table in worksheet.tables.values():
-        table.ref = ref
-        if table.autoFilter is not None:
-            table.autoFilter.ref = ref
+    overdue_values = [item.overdue_text for item in items]
+    if "已逾期" in overdue_values:
+        overdue = "已逾期"
+    elif overdue_values and all(value == "未逾期" for value in overdue_values):
+        overdue = "未逾期"
+    else:
+        overdue = None
+    return NormalizedItem(
+        enterprise_name=merge_text([item.enterprise_name for item in items]),
+        tax_types_text=merge_text([item.tax_types_text for item in items]),
+        periods_text=merge_text([item.periods_text for item in items]),
+        amounts_text=merge_text([item.amounts_text for item in items]),
+        overdue_text=overdue,
+        explanation=merge_text([item.explanation for item in items]) or "已完成提取",
+        needs_review=any(item.needs_review for item in items),
+        review_reasons=list(dict.fromkeys(reason for item in items for reason in item.review_reasons)),
+        conflicts=[conflict for item in items for conflict in item.conflicts],
+    )
 
 
 def _write_conflicts(path: Path, outcomes: list[RowBatchOutcome]) -> None:
@@ -585,25 +581,20 @@ def _validate_output_workbook(input_path: Path, output_path: Path, sheet_name: s
         output_header = tuple(output_sheet.cell(row=header_row, column=column).value for column in range(1, 17))
         if output_header != EXPECTED_COLUMNS or output_sheet.cell(row=header_row, column=17).value != "说明":
             raise ExtractionError("输出表头不正确")
-        expected_extra = sum(max(0, len(outcome.normalized_items) - 1) for outcome in outcomes)
-        if output_sheet.max_row != source_sheet.max_row + expected_extra:
-            raise ExtractionError("输出数据行数与拆行结果不一致")
-        extra_by_row = {
-            outcome.record.original_row_number: max(0, len(outcome.normalized_items) - 1)
-            for outcome in outcomes
-        }
+        if output_sheet.max_row != source_sheet.max_row:
+            raise ExtractionError("输出不得增加、删除或拆分原始数据行")
         for row in range(header_row + 1, source_sheet.max_row + 1):
-            offset = sum(extra for source_row, extra in extra_by_row.items() if source_row < row)
-            output_row = row + offset
             for col in range(1, 12):
-                if source_sheet.cell(row=row, column=col).value != output_sheet.cell(row=output_row, column=col).value:
+                source_cell = source_sheet.cell(row=row, column=col)
+                output_cell = output_sheet.cell(row=row, column=col)
+                if source_cell.value != output_cell.value:
                     raise ExtractionError("输出原始记录前11列发生变化")
-            extra = extra_by_row.get(row, 0)
-            for extra_offset in range(1, extra + 1):
-                inserted_row = output_row + extra_offset
-                for col in range(1, 12):
-                    if output_sheet.cell(row=inserted_row, column=col).value is not None:
-                        raise ExtractionError("新增拆分行前11列必须为空")
+                if source_cell.data_type != output_cell.data_type:
+                    raise ExtractionError("输出原始记录前11列数据类型发生变化")
+                if source_cell.number_format != output_cell.number_format:
+                    raise ExtractionError("输出原始记录前11列显示格式发生变化")
+                if source_cell._style != output_cell._style:
+                    raise ExtractionError("输出原始记录前11列单元格样式发生变化")
         for row in range(header_row + 1, output_sheet.max_row + 1):
             tax_value = output_sheet.cell(row=row, column=13).value
             overdue_value = output_sheet.cell(row=row, column=16).value
@@ -638,18 +629,26 @@ def _status_for_result(result: ExtractionResult, normalized: list[NormalizedItem
     return "success"
 
 
-def _save_raw_response(state_dir: Path, row_number: int, content: str) -> Path:
-    directory = state_dir / "raw"
+def _new_run_id() -> str:
+    return time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+
+def _row_run_directory(state_dir: Path, run_id: str, row_number: int) -> Path:
+    return state_dir / "runs" / run_id / f"row_{row_number:06d}"
+
+
+def _save_raw_response(state_dir: Path, run_id: str, row_number: int, content: str) -> Path:
+    directory = _row_run_directory(state_dir, run_id, row_number)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"batch_row_{row_number}_{uuid.uuid4().hex}.txt"
+    path = directory / "response.txt"
     path.write_text(content, encoding="utf-8")
     return path
 
 
-def _save_structured_result(state_dir: Path, row_number: int, result: ExtractionResult, status: str) -> Path:
-    directory = state_dir / "structured"
+def _save_structured_result(state_dir: Path, run_id: str, row_number: int, result: ExtractionResult, status: str) -> Path:
+    directory = _row_run_directory(state_dir, run_id, row_number)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"batch_row_{row_number}_{status}_{uuid.uuid4().hex}.json"
+    path = directory / "result.json"
     path.write_text(json.dumps({"status": status, "result": result.model_dump(mode="json")}, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 

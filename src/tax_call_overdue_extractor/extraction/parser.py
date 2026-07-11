@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from tax_call_overdue_extractor.exceptions import ResponseParseError
 
+from .normalization import normalize_enterprise_name_candidate
 from .schemas import ExtractionResult
 
 
@@ -19,7 +20,7 @@ ALLOWED_SOURCE_NAMES = (
     "业务内容",
     "答复内容",
 )
-SOURCE_PRIORITY = ("答复内容", "业务内容", "电话录音转文本内容")
+SOURCE_PRIORITY = ("业务内容", "答复内容", "电话录音转文本内容")
 EVIDENCE_FIELDS = ("enterprise_evidence", "tax_evidence", "overdue_evidence")
 STRING_EVIDENCE_REASON = "模型返回字符串形式证据，但无法在三个允许输入字段中唯一定位原文来源"
 INVALID_EVIDENCE_REASON = "模型返回的证据对象无法在指定输入字段中定位原文"
@@ -68,6 +69,9 @@ def preprocess_response_payload(
         return data
     texts = {name: source_texts.get(name) for name in ALLOWED_SOURCE_NAMES}
     normalized = deepcopy(data)
+    local_enterprise = _find_enterprise_name(texts)
+    if local_enterprise is not None:
+        normalized["conflicts"] = []
     items = normalized.get("items")
     if not isinstance(items, list):
         return normalized
@@ -79,6 +83,20 @@ def preprocess_response_payload(
             kept_items.append(item)
             continue
         notes: list[str] = _reason_list(item.get("review_reasons"))
+        if local_enterprise is not None:
+            enterprise_name, source, quote = local_enterprise
+            if item.get("enterprise_name") != enterprise_name:
+                notes.append(f"按{source}补充企业名称")
+            item["enterprise_name"] = enterprise_name
+            item["enterprise_evidence"] = [{"source": source, "quote": quote}]
+        elif item.get("enterprise_name"):
+            cleaned_enterprise = normalize_enterprise_name_candidate(str(item["enterprise_name"]))
+            if cleaned_enterprise is None:
+                notes.append("已忽略口语化企业代称")
+                item["enterprise_name"] = None
+                item["enterprise_evidence"] = []
+            else:
+                item["enterprise_name"] = cleaned_enterprise
         for field in EVIDENCE_FIELDS:
             item[field] = _repair_evidence_list(item.get(field, []), texts, notes)
         for child_field in ("periods", "amounts"):
@@ -90,19 +108,36 @@ def preprocess_response_payload(
                             child.get("evidence", []), texts, notes
                         )
 
-        _apply_reply_priority(item, texts, notes)
+        _apply_source_priority(item, texts, notes)
         _correct_explicit_overdue(item, notes)
         _remove_procedural_periods(item, texts, notes)
         item["review_reasons"] = _dedupe_reasons(notes)
         item["needs_review"] = False
 
-        if not _is_process_only_item(item):
-            kept_items.append(item)
+        if _is_process_only_item(item):
+            if item.get("enterprise_name"):
+                item.update(
+                    tax_types=[],
+                    tax_type_raw=[],
+                    tax_evidence=[],
+                    periods=[],
+                    amounts=[],
+                    explicitly_overdue=None,
+                    overdue_evidence=[],
+                    relationship_note="仅识别到企业名称，未发现明确税款或申报逾期信息",
+                )
+                kept_items.append(item)
+        else:
+            if _item_has_content(item):
+                kept_items.append(item)
 
+    if not kept_items and local_enterprise is not None:
+        enterprise_name, source, quote = local_enterprise
+        kept_items.append(_enterprise_only_item(enterprise_name, source, quote))
+
+    kept_items = _dedupe_items(kept_items)
     normalized["items"] = kept_items
-    if items and not kept_items:
-        normalized["has_relevant_information"] = False
-        normalized["conflicts"] = []
+    normalized["has_relevant_information"] = bool(kept_items)
 
     clear_conflict = bool(normalized.get("conflicts"))
     normalized["needs_review"] = clear_conflict
@@ -152,6 +187,78 @@ def _repair_evidence_list(
 
 def _matching_sources(source_texts: dict[str, str | None], quote: str) -> list[str]:
     return [source for source in SOURCE_PRIORITY if _contains_quote(source_texts.get(source), quote)]
+
+
+ENTERPRISE_SUFFIX = (
+    r"(?:股份有限公司|有限责任公司|有限公司|分公司|公司|个人独资企业|合伙企业|合作社|"
+    r"事务所|经营部|商行|中心|工作室|服务部|门市部|厂|店)"
+)
+ENTERPRISE_AFTER_CREDIT_CODE = re.compile(
+    rf"[0-9A-Z]{{18}}\s*[-—:：]?\s*([^\s，,；;。！？?\n]{{2,80}}{ENTERPRISE_SUFFIX})"
+)
+LABELED_ENTERPRISE = re.compile(
+    rf"(?:企业(?:名称)?|公司名称|纳税人)\s*[:：为]\s*([^，,；;。！？?\n]{{2,80}}{ENTERPRISE_SUFFIX})"
+)
+GENERAL_ENTERPRISE = re.compile(
+    rf"(?:^|[\s，,；;。！？?：:\-—])"
+    rf"([\u4e00-\u9fffA-Za-z（）()]{{3,60}}{ENTERPRISE_SUFFIX})"
+    rf"(?=$|[\s，,；;。！？?、（）()0-9])"
+)
+
+
+def _find_enterprise_name(
+    source_texts: dict[str, str | None],
+) -> tuple[str, str, str] | None:
+    """按业务内容、答复内容、电话录音顺序做保守的企业名称兜底。"""
+
+    for source in SOURCE_PRIORITY:
+        text = source_texts.get(source) or ""
+        for pattern in (ENTERPRISE_AFTER_CREDIT_CODE, LABELED_ENTERPRISE, GENERAL_ENTERPRISE):
+            match = pattern.search(text)
+            if not match:
+                continue
+            name = normalize_enterprise_name_candidate(match.group(1).strip(" -—:："))
+            if name is not None:
+                return name, source, name
+    return None
+
+
+def _enterprise_only_item(name: str, source: str, quote: str) -> dict[str, Any]:
+    return {
+        "enterprise_name": name,
+        "enterprise_evidence": [{"source": source, "quote": quote}],
+        "tax_types": [],
+        "tax_type_raw": [],
+        "tax_evidence": [],
+        "periods": [],
+        "amounts": [],
+        "explicitly_overdue": None,
+        "overdue_evidence": [],
+        "relationship_note": "仅识别到企业名称，未发现明确税款或申报逾期信息",
+        "needs_review": False,
+        "review_reasons": [f"按{source}补充企业名称"],
+    }
+
+
+def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = json.dumps(
+            {
+                "enterprise_name": item.get("enterprise_name"),
+                "tax_types": item.get("tax_types"),
+                "periods": item.get("periods"),
+                "amounts": item.get("amounts"),
+                "explicitly_overdue": item.get("explicitly_overdue"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
 
 
 def _contains_quote(source_text: str | None, quote: str) -> bool:
@@ -230,27 +337,30 @@ def _correct_explicit_overdue(item: dict[str, Any], review_reasons: list[str]) -
         review_reasons.append("模型把假设性逾期咨询误判为已逾期，已在本地纠正")
 
 
-def _apply_reply_priority(
+def _apply_source_priority(
     item: dict[str, Any],
     source_texts: dict[str, str | None],
     notes: list[str],
 ) -> None:
-    reply = source_texts.get("答复内容") or ""
-    if not reply:
-        return
-    process_only = any(word in reply for word in PROCESS_WORDS) and not any(
-        re.search(pattern, reply) for pattern in TAX_OVERDUE_PATTERNS
-    )
-    if process_only:
-        return
-    if re.search(r"(?:尚未|并未|没有|未).{0,8}(?:逾期|到期|超过期限)", reply):
-        if item.get("explicitly_overdue") is not False:
-            notes.append("按答复内容优先，将逾期状态确定为未逾期")
-        item["explicitly_overdue"] = False
-    elif any(re.search(pattern, reply) for pattern in TAX_OVERDUE_PATTERNS):
-        if item.get("explicitly_overdue") is not True:
-            notes.append("按答复内容优先，将逾期状态确定为已逾期")
-        item["explicitly_overdue"] = True
+    for source in SOURCE_PRIORITY[:2]:
+        text = source_texts.get(source) or ""
+        if not text:
+            continue
+        process_only = any(word in text for word in PROCESS_WORDS) and not any(
+            re.search(pattern, text) for pattern in TAX_OVERDUE_PATTERNS
+        )
+        if process_only:
+            continue
+        if re.search(r"(?:尚未|并未|没有|未).{0,8}(?:逾期|到期|超过期限)", text):
+            if item.get("explicitly_overdue") is not False:
+                notes.append(f"按{source}优先，将逾期状态确定为未逾期")
+            item["explicitly_overdue"] = False
+            return
+        if any(re.search(pattern, text) for pattern in TAX_OVERDUE_PATTERNS):
+            if item.get("explicitly_overdue") is not True:
+                notes.append(f"按{source}优先，将逾期状态确定为已逾期")
+            item["explicitly_overdue"] = True
+            return
 
 
 def _is_process_only_item(item: dict[str, Any]) -> bool:

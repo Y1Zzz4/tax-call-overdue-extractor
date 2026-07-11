@@ -200,6 +200,12 @@ def test_50_rows_batch_processing_and_outputs(tmp_path: Path) -> None:
     assert summary.output_path.exists()
     assert summary.conflicts_output_path.exists()
     assert summary.review_output_path.exists()
+    run_rows = list(settings.paths.state_dir.glob("runs/*/row_*/result.json"))
+    raw_rows = list(settings.paths.state_dir.glob("runs/*/row_*/response.txt"))
+    assert len(run_rows) == 50
+    assert len(raw_rows) == 50
+    assert not (settings.paths.state_dir / "raw").exists()
+    assert not (settings.paths.state_dir / "structured").exists()
     wb = load_workbook(summary.output_path)
     try:
         ws = wb.active
@@ -290,7 +296,27 @@ def test_resume_reuses_success_and_reprocesses_changed_input_or_prompt(tmp_path:
     assert len(fourth_client.calls) == 1
 
 
-def test_multi_item_insert_rows_and_first_11_columns_blank(tmp_path: Path) -> None:
+def test_resume_reprocesses_when_cached_result_file_is_missing(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.samples_dir / "sample.xlsx"
+    create_batch_workbook(source, 1)
+    first = RoutingClient()
+    BatchExtractionService(settings, llm_client=first, system_prompt="same-prompt").run(
+        BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
+    )
+    assert len(first.calls) == 1
+    result_file = next(settings.paths.state_dir.glob("runs/*/row_*/result.json"))
+    result_file.unlink()
+
+    second = RoutingClient()
+    BatchExtractionService(settings, llm_client=second, system_prompt="same-prompt").run(
+        BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
+    )
+
+    assert len(second.calls) == 1
+
+
+def test_multi_items_are_merged_without_changing_original_rows(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     source = settings.paths.samples_dir / "sample.xlsx"
     create_batch_workbook(source, 2)
@@ -303,11 +329,11 @@ def test_multi_item_insert_rows_and_first_11_columns_blank(tmp_path: Path) -> No
     wb = load_workbook(summary.output_path)
     try:
         ws = wb.active
-        assert ws.max_row == 4
-        assert ws.cell(row=2, column=12).value == "甲企业"
-        assert ws.cell(row=3, column=12).value == "乙企业"
-        assert all(ws.cell(row=3, column=col).value is None for col in range(1, 12))
-        assert ws.cell(row=3, column=1).font.name == ws.cell(row=2, column=1).font.name
+        assert ws.max_row == 3
+        assert ws.cell(row=2, column=12).value == "甲企业；乙企业"
+        assert ws.cell(row=2, column=13).value == "增值税；企业所得税"
+        assert ws.cell(row=2, column=14).value == "2025年5月到2025年5月；2025年6月到2025年6月"
+        assert ws.cell(row=3, column=1).value == 2
     finally:
         wb.close()
 
@@ -345,7 +371,29 @@ def test_period_normalization_and_overdue_rules() -> None:
     assert equal.overdue_text is None
     assert future.overdue_text is None
     assert year.periods_text == "2025年1月到2025年12月"
-    assert year.overdue_text is None
+    assert year.overdue_text == "已逾期"
+
+
+def test_local_overdue_rule_uses_fixed_month_column_reference() -> None:
+    reference = parse_reference_month("2026-06-20", "2026-06")
+
+    def overdue(year: int, month: int) -> str | None:
+        result = parse_extraction_response(extraction_json(periods=[period(year, month)]))
+        return normalize_extraction_result(result, reference_month=reference)[0].overdue_text
+
+    assert overdue(2024, 12) == "已逾期"
+    assert overdue(2025, 12) == "已逾期"
+    assert overdue(2026, 5) == "已逾期"
+    assert overdue(2026, 6) is None
+    assert overdue(2026, 7) is None
+
+
+def test_month_formula_uses_registration_date_instead_of_formula_row_number() -> None:
+    reference = parse_reference_month("2026-06-20", "=MONTH(H22)")
+
+    assert reference is not None
+    assert reference.year == 2026
+    assert reference.month == 6
 
 
 def test_explicit_overdue_and_conflicting_status_outputs(tmp_path: Path) -> None:

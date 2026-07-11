@@ -349,6 +349,104 @@ def test_header_columns_values_and_styles_are_preserved(tmp_path: Path) -> None:
         output_workbook.close()
 
 
+def test_sampling_preserves_each_selected_rows_month_exactly(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=30)
+    workbook = load_workbook(source)
+    try:
+        for row in range(2, 32):
+            cell = workbook.active.cell(row=row, column=9)
+            cell.value = f"2026-{(row % 12) + 1:02d}"
+            cell.number_format = "@"
+        workbook.save(source)
+    finally:
+        workbook.close()
+
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=12,
+        seed=17,
+    )
+
+    source_workbook = load_workbook(source, data_only=False)
+    output_workbook = load_workbook(output, data_only=False)
+    try:
+        for offset, source_row in enumerate(result.selected_rows, start=2):
+            source_cell = source_workbook.active.cell(row=source_row, column=9)
+            output_cell = output_workbook.active.cell(row=offset, column=9)
+            assert output_cell.value == source_cell.value
+            assert output_cell.data_type == source_cell.data_type
+            assert output_cell.number_format == source_cell.number_format
+    finally:
+        source_workbook.close()
+        output_workbook.close()
+
+
+def test_month_mutation_is_rejected_by_sample_validation(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=10)
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=5,
+        seed=4,
+    )
+    workbook = load_workbook(output)
+    try:
+        workbook.active.cell(row=2, column=9).value = "2099-12"
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    with pytest.raises(OutputValidationError, match="抽样月份公式未指向当前行"):
+        validate_sample_output(
+            input_path=source,
+            output_path=output,
+            selected_rows=result.selected_rows,
+            sheet_name=result.sheet_name,
+            header_row=1,
+        )
+
+
+def test_sampling_translates_month_formula_to_current_sample_row(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.input_dir / "source.xlsx"
+    output = settings.paths.samples_dir / "sample.xlsx"
+    create_source_workbook(source, valid_rows=30)
+    workbook = load_workbook(source)
+    try:
+        for row in range(2, 32):
+            workbook.active.cell(row=row, column=9).value = f"=MONTH(H{row})"
+        workbook.save(source)
+    finally:
+        workbook.close()
+
+    result = sample_excel_file(
+        settings=settings,
+        input_path=source,
+        output_path=output,
+        sample_size=10,
+        seed=8,
+    )
+
+    workbook = load_workbook(output, data_only=False)
+    try:
+        worksheet = workbook.active
+        for output_row in range(2, 12):
+            assert worksheet.cell(row=output_row, column=9).value == f"=MONTH(H{output_row})"
+        assert workbook.calculation.calcMode == "auto"
+        assert workbook.calculation.fullCalcOnLoad is True
+    finally:
+        workbook.close()
+
+
 def test_newline_normalization_is_accepted_as_equivalent_content(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     source = settings.paths.input_dir / "source.xlsx"
