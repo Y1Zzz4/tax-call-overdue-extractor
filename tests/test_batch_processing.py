@@ -208,6 +208,8 @@ def test_50_rows_batch_processing_and_outputs(tmp_path: Path) -> None:
         assert ws.cell(row=2, column=13).value == "增值税；城市建设维护税"
         assert ws.cell(row=2, column=14).value == "2025年5月到2025年5月"
         assert ws.cell(row=2, column=16).value == "已逾期"
+        assert ws.cell(row=2, column=17).value
+        assert ws.cell(row=1, column=17).value == "说明"
         assert ws.cell(row=2, column=1).font.name == "Arial"
         assert ws.freeze_panes == "A2"
     finally:
@@ -229,8 +231,12 @@ def test_single_allowed_field_calls_model_and_blank_row_skips(tmp_path: Path) ->
     wb = load_workbook(summary.output_path)
     try:
         ws = wb.active
-        assert ws.cell(row=3, column=12).value is None
-        assert ws.cell(row=3, column=16).value is None
+        assert ws.cell(row=3, column=12).value == "未识别"
+        assert ws.cell(row=3, column=13).value == "未识别"
+        assert ws.cell(row=3, column=14).value == "未识别"
+        assert ws.cell(row=3, column=15).value == "未提及"
+        assert ws.cell(row=3, column=16).value == "未明确"
+        assert ws.cell(row=3, column=17).value == "三列均无可分析文本"
     finally:
         wb.close()
 
@@ -356,15 +362,16 @@ def test_explicit_overdue_and_conflicting_status_outputs(tmp_path: Path) -> None
         BatchOptions(input_path=source, execute=True, overwrite=True)
     )
 
-    assert summary.conflict_count == 1
+    assert summary.conflict_count == 0
+    assert summary.success_count == 1
     wb = load_workbook(summary.output_path)
     try:
-        assert wb.active.cell(row=2, column=16).value is None
+        assert wb.active.cell(row=2, column=16).value == "未逾期"
     finally:
         wb.close()
     conflict_wb = load_workbook(summary.conflicts_output_path)
     try:
-        assert conflict_wb.active.max_row >= 2
+        assert conflict_wb.active.max_row == 1
     finally:
         conflict_wb.close()
 

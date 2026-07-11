@@ -74,12 +74,13 @@ def test_invalid_json_is_rejected() -> None:
         parse_extraction_response("{not json")
 
 
-def test_schema_validation_error_is_rejected() -> None:
+def test_missing_review_flag_is_tolerated() -> None:
     payload = minimal_result()
     del payload["needs_review"]
 
-    with pytest.raises(ResponseParseError, match="不符合提取 Schema"):
-        parse_extraction_response(json.dumps(payload, ensure_ascii=False))
+    result = parse_extraction_response(json.dumps(payload, ensure_ascii=False))
+
+    assert result.needs_review is False
 
 
 def test_parser_keeps_enterprise_only_item() -> None:
@@ -186,8 +187,7 @@ def test_parser_normalizes_model_shorthand_period_and_item_evidence() -> None:
     assert result.has_relevant_information is True
     item = result.items[0]
     assert item.enterprise_name == "丁测试企业"
-    assert item.needs_review is True
-    assert "模型未提供 item.needs_review" in item.review_reasons[0]
+    assert item.needs_review is False
     assert item.enterprise_evidence[0].source == "业务内容"
     assert item.periods[0].raw_text == "2026年2月"
     assert item.periods[0].period_type == "unparsed"
@@ -227,7 +227,7 @@ def test_string_evidence_is_converted_only_when_source_is_unique() -> None:
     assert result.needs_review is False
 
 
-def test_unlocatable_or_ambiguous_evidence_is_removed_and_reviewed() -> None:
+def test_unlocatable_evidence_is_removed_and_ambiguous_uses_source_priority() -> None:
     item = base_item()
     item["enterprise_name"] = "甲测试企业"
     item["enterprise_evidence"] = ["模型改写的企业名称", "共同证据"]
@@ -237,13 +237,13 @@ def test_unlocatable_or_ambiguous_evidence_is_removed_and_reviewed() -> None:
         SOURCE_TEXTS,
     )
 
-    assert result.items[0].enterprise_evidence == []
-    assert result.items[0].needs_review is True
-    assert result.needs_review is True
-    assert any("无法在三个允许输入字段中唯一定位" in reason for reason in result.review_reasons)
+    assert len(result.items[0].enterprise_evidence) == 1
+    assert result.items[0].enterprise_evidence[0].source == "业务内容"
+    assert result.items[0].needs_review is False
+    assert result.needs_review is False
 
 
-def test_evidence_object_with_wrong_source_is_removed_and_reviewed() -> None:
+def test_evidence_object_with_wrong_source_is_remapped_without_review() -> None:
     item = base_item()
     item["enterprise_name"] = "甲测试企业"
     item["enterprise_evidence"] = [
@@ -255,8 +255,9 @@ def test_evidence_object_with_wrong_source_is_removed_and_reviewed() -> None:
         SOURCE_TEXTS,
     )
 
-    assert result.items[0].enterprise_evidence == []
-    assert any("证据对象无法在指定输入字段" in reason for reason in result.review_reasons)
+    assert result.items[0].enterprise_evidence[0].source == "业务内容"
+    assert result.items[0].needs_review is False
+    assert "证据来源已按原文自动修正" in result.items[0].review_reasons
 
 
 def test_hypothetical_overdue_question_cannot_be_explicitly_overdue() -> None:
@@ -277,7 +278,62 @@ def test_hypothetical_overdue_question_cannot_be_explicitly_overdue() -> None:
 
     assert result.items[0].explicitly_overdue is None
     assert result.items[0].overdue_evidence == []
-    assert result.items[0].needs_review is True
+    assert result.items[0].needs_review is False
+
+
+def test_common_period_amount_variants_and_wrapped_json_are_tolerated() -> None:
+    item = base_item()
+    item.update({
+        "tax_types": ["个税"],
+        "tax_type_raw": ["个税"],
+        "periods": [{"period_value": "去年7月份"}],
+        "amounts": [{"amount_raw": "50块钱", "amount_type": "罚款"}],
+    })
+    raw = "以下是结果：\n" + json.dumps(relevant_result_with_item(item), ensure_ascii=False) + "\n完成"
+
+    result = parse_extraction_response(raw)
+
+    assert result.items[0].tax_types == ["个人所得税"]
+    assert result.items[0].periods[0].raw_text == "去年7月份"
+    assert result.items[0].amounts[0].raw_text == "50块钱"
+    assert result.items[0].amounts[0].role == "penalty"
+
+
+def test_reply_content_overrides_overdue_status() -> None:
+    item = base_item()
+    item["tax_types"] = ["增值税"]
+    item["explicitly_overdue"] = True
+    source_texts = {
+        "电话录音转文本内容": "系统好像说逾期了",
+        "业务内容": "疑似逾期",
+        "答复内容": "经核实目前尚未逾期",
+    }
+
+    result = parse_extraction_response(
+        json.dumps(relevant_result_with_item(item), ensure_ascii=False), source_texts
+    )
+
+    assert result.items[0].explicitly_overdue is False
+    assert result.items[0].needs_review is False
+
+
+def test_only_clear_reply_enterprise_conflict_requires_review() -> None:
+    item = base_item()
+    item["enterprise_name"] = "甲公司"
+    payload = relevant_result_with_item(item)
+    payload["conflicts"] = [{
+        "field": "enterprise_name",
+        "sources": [
+            {"source": "答复内容", "quote": "乙公司"},
+            {"source": "业务内容", "quote": "甲公司"},
+        ],
+        "description": "两个明确企业名称不一致",
+    }]
+
+    result = parse_extraction_response(json.dumps(payload, ensure_ascii=False))
+
+    assert result.needs_review is True
+    assert len(result.conflicts) == 1
 
 
 def test_row_2_refund_workflow_is_not_tax_overdue_or_tax_period() -> None:

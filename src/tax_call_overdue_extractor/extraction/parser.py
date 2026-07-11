@@ -19,6 +19,7 @@ ALLOWED_SOURCE_NAMES = (
     "业务内容",
     "答复内容",
 )
+SOURCE_PRIORITY = ("答复内容", "业务内容", "电话录音转文本内容")
 EVIDENCE_FIELDS = ("enterprise_evidence", "tax_evidence", "overdue_evidence")
 STRING_EVIDENCE_REASON = "模型返回字符串形式证据，但无法在三个允许输入字段中唯一定位原文来源"
 INVALID_EVIDENCE_REASON = "模型返回的证据对象无法在指定输入字段中定位原文"
@@ -43,9 +44,8 @@ def parse_extraction_response(
 ) -> ExtractionResult:
     """解析模型响应并执行完整 Schema 校验。"""
 
-    text = _strip_code_fence(raw_response)
     try:
-        data: Any = json.loads(text)
+        data: Any = _load_json_object(raw_response)
     except json.JSONDecodeError as exc:
         raise ResponseParseError(f"模型响应不是合法 JSON: {exc.msg}") from exc
 
@@ -73,31 +73,28 @@ def preprocess_response_payload(
         return normalized
 
     kept_items: list[Any] = []
-    top_review_reasons = _reason_list(normalized.get("review_reasons"))
+    top_notes = _reason_list(normalized.get("review_reasons"))
     for item in items:
         if not isinstance(item, dict):
             kept_items.append(item)
             continue
-        evidence_reasons: list[str] = []
+        notes: list[str] = _reason_list(item.get("review_reasons"))
         for field in EVIDENCE_FIELDS:
-            item[field] = _repair_evidence_list(item.get(field, []), texts, evidence_reasons)
+            item[field] = _repair_evidence_list(item.get(field, []), texts, notes)
         for child_field in ("periods", "amounts"):
             children = item.get(child_field)
             if isinstance(children, list):
                 for child in children:
                     if isinstance(child, dict):
                         child["evidence"] = _repair_evidence_list(
-                            child.get("evidence", []), texts, evidence_reasons
+                            child.get("evidence", []), texts, notes
                         )
 
-        _correct_explicit_overdue(item, evidence_reasons)
-        _remove_procedural_periods(item, texts, evidence_reasons)
-        if evidence_reasons:
-            item["needs_review"] = True
-            item["review_reasons"] = _dedupe_reasons(
-                [*_reason_list(item.get("review_reasons")), *evidence_reasons]
-            )
-            top_review_reasons.extend(evidence_reasons)
+        _apply_reply_priority(item, texts, notes)
+        _correct_explicit_overdue(item, notes)
+        _remove_procedural_periods(item, texts, notes)
+        item["review_reasons"] = _dedupe_reasons(notes)
+        item["needs_review"] = False
 
         if not _is_process_only_item(item):
             kept_items.append(item)
@@ -107,12 +104,9 @@ def preprocess_response_payload(
         normalized["has_relevant_information"] = False
         normalized["conflicts"] = []
 
-    if top_review_reasons:
-        normalized["needs_review"] = True
-        normalized["review_reasons"] = _dedupe_reasons(top_review_reasons)
-    elif not kept_items:
-        normalized["needs_review"] = False
-        normalized["review_reasons"] = []
+    clear_conflict = bool(normalized.get("conflicts"))
+    normalized["needs_review"] = clear_conflict
+    normalized["review_reasons"] = _dedupe_reasons(top_notes) if clear_conflict else []
     return normalized
 
 
@@ -136,23 +130,28 @@ def _repair_evidence_list(
                 and quote.strip()
                 and _contains_quote(source_texts.get(source), quote)
             ):
-                repaired.append({"source": source, "quote": quote})
+                repaired.append({"source": source, "quote": quote[:200]})
             else:
-                review_reasons.append(INVALID_EVIDENCE_REASON)
+                matching_sources = _matching_sources(source_texts, quote) if isinstance(quote, str) else []
+                if matching_sources:
+                    repaired.append({"source": matching_sources[0], "quote": quote[:200]})
+                    review_reasons.append("证据来源已按原文自动修正")
+                else:
+                    review_reasons.append(INVALID_EVIDENCE_REASON)
             continue
         if isinstance(evidence, str) and evidence.strip():
-            matching_sources = [
-                source
-                for source, text in source_texts.items()
-                if _contains_quote(text, evidence)
-            ]
-            if len(matching_sources) == 1:
-                repaired.append({"source": matching_sources[0], "quote": evidence})
+            matching_sources = _matching_sources(source_texts, evidence)
+            if matching_sources:
+                repaired.append({"source": matching_sources[0], "quote": evidence[:200]})
             else:
                 review_reasons.append(STRING_EVIDENCE_REASON)
             continue
         review_reasons.append(INVALID_EVIDENCE_REASON)
     return repaired
+
+
+def _matching_sources(source_texts: dict[str, str | None], quote: str) -> list[str]:
+    return [source for source in SOURCE_PRIORITY if _contains_quote(source_texts.get(source), quote)]
 
 
 def _contains_quote(source_text: str | None, quote: str) -> bool:
@@ -231,6 +230,29 @@ def _correct_explicit_overdue(item: dict[str, Any], review_reasons: list[str]) -
         review_reasons.append("模型把假设性逾期咨询误判为已逾期，已在本地纠正")
 
 
+def _apply_reply_priority(
+    item: dict[str, Any],
+    source_texts: dict[str, str | None],
+    notes: list[str],
+) -> None:
+    reply = source_texts.get("答复内容") or ""
+    if not reply:
+        return
+    process_only = any(word in reply for word in PROCESS_WORDS) and not any(
+        re.search(pattern, reply) for pattern in TAX_OVERDUE_PATTERNS
+    )
+    if process_only:
+        return
+    if re.search(r"(?:尚未|并未|没有|未).{0,8}(?:逾期|到期|超过期限)", reply):
+        if item.get("explicitly_overdue") is not False:
+            notes.append("按答复内容优先，将逾期状态确定为未逾期")
+        item["explicitly_overdue"] = False
+    elif any(re.search(pattern, reply) for pattern in TAX_OVERDUE_PATTERNS):
+        if item.get("explicitly_overdue") is not True:
+            notes.append("按答复内容优先，将逾期状态确定为已逾期")
+        item["explicitly_overdue"] = True
+
+
 def _is_process_only_item(item: dict[str, Any]) -> bool:
     evidence_quotes: list[str] = []
     for field in EVIDENCE_FIELDS:
@@ -266,48 +288,72 @@ def _strip_code_fence(raw_response: str) -> str:
     return match.group(1).strip()
 
 
+def _load_json_object(raw_response: str) -> Any:
+    """接受纯 JSON、代码块以及 JSON 前后夹有少量说明文字的常见响应。"""
+
+    text = _strip_code_fence(raw_response)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        raise original_error
+
+
 def _normalize_response_payload(data: Any) -> Any:
-    """规范化模型常见的非标准 JSON 形态；不补造业务事实。"""
+    """把模型常见的近义字段统一成一个简单、稳定的内部结构。"""
 
     if not isinstance(data, dict):
         return data
 
-    normalized = dict(data)
-    items = normalized.get("items")
-    if isinstance(items, list):
-        normalized["items"] = [_normalize_item(item) for item in items]
-    if normalized.get("has_relevant_information") is True and "needs_review" not in normalized:
-        item_reviews = [
-            item.get("needs_review")
-            for item in normalized.get("items", [])
-            if isinstance(item, dict)
-        ]
-        normalized["needs_review"] = any(value is True for value in item_reviews)
-    return normalized
+    raw_items = data.get("items", [])
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    items = [_normalize_item(item) for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+    items = [item for item in items if _item_has_content(item)]
+    conflicts = _normalize_conflicts(data.get("conflicts", []))
+    has_information = bool(items)
+    return {
+        "schema_version": "1.0",
+        "has_relevant_information": has_information,
+        "items": items,
+        "conflicts": conflicts,
+        "needs_review": bool(conflicts),
+        "review_reasons": _reason_list(data.get("review_reasons")),
+    }
 
 
 def _normalize_item(item: Any) -> Any:
     if not isinstance(item, dict):
         return item
 
-    normalized = dict(item)
-    fallback_evidence = _valid_evidence_list(normalized.pop("evidence", []))
-
-    if "needs_review" not in normalized:
-        normalized["needs_review"] = True
-        reasons = normalized.get("review_reasons")
-        if not isinstance(reasons, list):
-            reasons = []
-        normalized["review_reasons"] = [
-            *reasons,
-            "模型未提供 item.needs_review，已标记待复核",
-        ]
-
-    if normalized.get("enterprise_name") and not normalized.get("enterprise_evidence") and fallback_evidence:
-        normalized["enterprise_evidence"] = fallback_evidence
-
-    normalized["periods"] = _normalize_periods(normalized.get("periods", []), fallback_evidence)
-    normalized["amounts"] = _normalize_amounts(normalized.get("amounts", []), fallback_evidence)
+    fallback_evidence = item.get("evidence", [])
+    enterprise = _optional_string(item.get("enterprise_name"))
+    raw_tax_types = _string_list(item.get("tax_types"))
+    tax_raw = _string_list(item.get("tax_type_raw")) or list(raw_tax_types)
+    tax_types = _normalize_tax_types(raw_tax_types, tax_raw)
+    normalized = {
+        "enterprise_name": enterprise,
+        "enterprise_evidence": item.get("enterprise_evidence") or (fallback_evidence if enterprise else []),
+        "tax_types": tax_types,
+        "tax_type_raw": tax_raw,
+        "tax_evidence": item.get("tax_evidence") or [],
+        "periods": _normalize_periods(item.get("periods", []), fallback_evidence),
+        "amounts": _normalize_amounts(item.get("amounts", []), fallback_evidence),
+        "explicitly_overdue": _optional_bool(item.get("explicitly_overdue")),
+        "overdue_evidence": item.get("overdue_evidence") or [],
+        "relationship_note": _optional_string(item.get("relationship_note")),
+        "needs_review": False,
+        "review_reasons": _reason_list(item.get("review_reasons")),
+    }
     return normalized
 
 
@@ -334,12 +380,22 @@ def _normalize_periods(periods: Any, fallback_evidence: list[dict[str, Any]]) ->
             )
             continue
         if isinstance(period, dict):
-            period_dict = dict(period)
-            if "period_type" not in period_dict and period_dict.get("raw_text"):
-                period_dict["period_type"] = "unparsed"
-            if "evidence" not in period_dict and fallback_evidence:
-                period_dict["evidence"] = fallback_evidence
-            normalized_periods.append(period_dict)
+            raw_text = _first_text(period, "raw_text", "original_text", "period_value", "period_raw", "value", "raw", "mention")
+            if raw_text is None:
+                raw_text = _period_from_parts(period)
+            if raw_text is None:
+                continue
+            period_type = _period_type(period.get("period_type") or period.get("type"), raw_text)
+            normalized_periods.append({
+                "raw_text": raw_text,
+                "period_type": period_type,
+                "start_year": _safe_int(period.get("start_year")),
+                "start_month": _safe_month(period.get("start_month")),
+                "end_year": _safe_int(period.get("end_year")),
+                "end_month": _safe_month(period.get("end_month")),
+                "relative_expression": _optional_string(period.get("relative_expression")),
+                "evidence": period.get("evidence") or fallback_evidence,
+            })
             continue
         normalized_periods.append(period)
     return normalized_periods
@@ -365,12 +421,16 @@ def _normalize_amounts(amounts: Any, fallback_evidence: list[dict[str, Any]]) ->
             )
             continue
         if isinstance(amount, dict):
-            amount_dict = dict(amount)
-            amount_dict.setdefault("role", "unknown")
-            amount_dict.setdefault("is_calculated", False)
-            if "evidence" not in amount_dict and fallback_evidence:
-                amount_dict["evidence"] = fallback_evidence
-            normalized_amounts.append(amount_dict)
+            raw_text = _first_text(amount, "raw_text", "amount_raw", "amount", "value", "raw")
+            if raw_text is None:
+                continue
+            normalized_amounts.append({
+                "raw_text": raw_text,
+                "role": _amount_role(amount.get("role") or amount.get("amount_type") or amount.get("type")),
+                "is_calculated": bool(amount.get("is_calculated", False)),
+                "calculation_note": _optional_string(amount.get("calculation_note")),
+                "evidence": amount.get("evidence") or fallback_evidence,
+            })
             continue
         normalized_amounts.append(amount)
     return normalized_amounts
@@ -380,6 +440,154 @@ def _valid_evidence_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _normalize_tax_types(values: list[str], raw_values: list[str]) -> list[str]:
+    aliases = {"个税": "个人所得税", "城建税": "城市建设维护税", "企业所的税": "企业所得税"}
+    normalized: list[str] = []
+    for value in [*values, *raw_values]:
+        mapped = aliases.get(value, value)
+        if mapped in {
+            "增值税", "个人所得税", "企业所得税", "消费税", "印花税", "城镇土地使用税",
+            "车辆购置税", "城市建设维护税", "契税", "房产税", "车船税", "耕地占用税",
+            "资源税", "环境保护税", "烟叶税", "进出口税", "残保金", "非税收入", "其他", "未识别",
+        } and mapped not in normalized:
+            normalized.append(mapped)
+    return normalized or (["未识别"] if raw_values else [])
+
+
+def _normalize_conflicts(value: Any) -> list[dict[str, Any]]:
+    """只保留答复内容与其他来源之间明确的企业名称冲突。"""
+
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for conflict in value:
+        if not isinstance(conflict, dict):
+            continue
+        field = conflict.get("field")
+        if field != "enterprise_name":
+            continue
+        raw_claims = conflict.get("claims") or conflict.get("sources") or conflict.get("values") or []
+        claims: list[dict[str, str]] = []
+        if isinstance(raw_claims, list):
+            for claim in raw_claims:
+                if not isinstance(claim, dict) or claim.get("source") not in ALLOWED_SOURCE_NAMES:
+                    continue
+                text = _optional_string(claim.get("value") or claim.get("quote"))
+                quote = _optional_string(claim.get("quote") or claim.get("value"))
+                if text and quote:
+                    claims.append({"source": claim["source"], "value": text, "quote": quote[:200]})
+        sources = {claim["source"] for claim in claims}
+        values = {claim["value"] for claim in claims}
+        if "答复内容" in sources and len(sources) >= 2 and len(values) >= 2:
+            result.append({
+                "field": "enterprise_name",
+                "description": _optional_string(conflict.get("description") or conflict.get("note")) or "答复内容与其他来源的企业名称明确不一致",
+                "claims": claims,
+            })
+    return result
+
+
+def _item_has_content(item: dict[str, Any]) -> bool:
+    return any(
+        (
+            item.get("enterprise_name"),
+            item.get("tax_types"),
+            item.get("tax_type_raw"),
+            item.get("periods"),
+            item.get("amounts"),
+            item.get("explicitly_overdue") is not None,
+            item.get("overdue_evidence"),
+        )
+    )
+
+
+def _first_text(value: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        text = _optional_string(value.get(key))
+        if text:
+            return text
+    return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := _optional_string(item))]
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool) or value is None:
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "1", "是", "已逾期"}:
+        return True
+    if text in {"false", "no", "0", "否", "未逾期"}:
+        return False
+    return None
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_month(value: Any) -> int | None:
+    parsed = _safe_int(value)
+    return parsed if parsed is not None and 1 <= parsed <= 12 else None
+
+
+def _period_from_parts(period: dict[str, Any]) -> str | None:
+    year = _safe_int(period.get("year"))
+    month = _safe_month(period.get("month"))
+    quarter = _safe_int(period.get("quarter"))
+    if year and month:
+        return f"{year}年{month}月"
+    if year and quarter in {1, 2, 3, 4}:
+        return f"{year}年第{quarter}季度"
+    return f"{year}年" if year else None
+
+
+def _period_type(value: Any, raw_text: str) -> str:
+    allowed = {"single_month", "month_range", "quarter", "year", "relative", "unparsed"}
+    if value in allowed:
+        return str(value)
+    if re.search(r"季度", raw_text):
+        return "quarter"
+    if re.search(r"(?:至|到|—|-)", raw_text) and re.search(r"\d{4}年", raw_text):
+        return "month_range"
+    if re.fullmatch(r"\d{4}年", raw_text):
+        return "year"
+    if re.search(r"\d{4}年\s*\d{1,2}月", raw_text):
+        return "single_month"
+    if re.search(r"去年|今年|上个月|本月|上季度|本季度", raw_text):
+        return "relative"
+    return "unparsed"
+
+
+def _amount_role(value: Any) -> str:
+    text = str(value or "").lower()
+    if text in {"tax", "late_fee", "penalty", "total", "other", "unknown"}:
+        return text
+    if "滞纳" in text:
+        return "late_fee"
+    if "罚" in text:
+        return "penalty"
+    if "税" in text:
+        return "tax"
+    return "unknown"
 
 
 def _safe_validation_error_summary(exc: ValidationError) -> str:

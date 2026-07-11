@@ -64,7 +64,17 @@ python scripts/run.py all --input /path/to/full.xlsx --overwrite
 
 登记日期、月份、号码、人员、部门、业务编号、Excel 行号、路径和工作表名都不会进入模型请求。登记日期和月份只在本地用于相对日期换算。
 
-模型请求最多使用 `response_format={"type":"json_object"}`，不会发送 JSON Schema。返回 JSON 会经过本地 Evidence 修复、严格 Pydantic 校验和业务规则过滤。
+模型请求最多使用 `response_format={"type":"json_object"}`，不会发送 JSON Schema。三个字段按“答复内容 → 业务内容 → 电话录音转文本内容”的顺序发送；有明确结论时以答复内容为准。
+
+模型输出不要求一次完全符合内部格式。程序会自动兼容常见的 `value`、`original_text`、`period_raw`、`amount_raw`、字符串 Evidence、JSON 代码块和 JSON 前后说明文字，再统一成最终结果。
+
+最终 Excel 在原五个结果字段后增加“说明”列。未识别字段会显示“未识别”“未提及”或“未明确”，不会留空。普通缺失和自动修复只写入说明，不进入 review。
+
+review 只保留以下明显问题：
+
+- 模型接口失败或响应完全不是可解析 JSON
+- 三列均无有效文本或输入过长
+- 答复内容与其他来源明确给出不同企业名称，且明显不是同音字或转录错误
 
 ## 结果与断点状态
 

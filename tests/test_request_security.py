@@ -134,3 +134,13 @@ def test_valid_business_content_is_not_converted_to_null() -> None:
     assert user_data["电话录音转文本内容"] is None
     assert user_data["业务内容"] == "明确有效的业务内容"
     assert user_data["答复内容"] is None
+
+
+def test_user_message_orders_reply_content_first() -> None:
+    model_input = build_model_input(
+        voice_text="电话",
+        business_content="业务",
+        reply_content="答复",
+    )
+
+    assert model_input.serialized_user_message.startswith('{"答复内容":"答复","业务内容":"业务"')

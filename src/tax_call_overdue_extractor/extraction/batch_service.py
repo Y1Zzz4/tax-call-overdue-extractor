@@ -41,7 +41,14 @@ RESULT_COLUMNS = {
     "所属期": 14,
     "涉及金额": 15,
     "是否确定已逾期": 16,
+    "说明": 17,
 }
+OUTPUT_COLUMN_COUNT = 17
+UNKNOWN_ENTERPRISE = "未识别"
+UNKNOWN_TAX = "未识别"
+UNKNOWN_PERIOD = "未识别"
+UNKNOWN_AMOUNT = "未提及"
+UNKNOWN_OVERDUE = "未明确"
 
 
 @dataclass(frozen=True)
@@ -424,7 +431,7 @@ def write_outputs(
         try:
             worksheet = workbook[sheet_name]
             validate_header(worksheet, header_row)
-            _write_result_rows(worksheet, outcomes)
+            _write_result_rows(worksheet, outcomes, header_row)
             _update_ranges(worksheet)
             workbook.save(temp_path)
         finally:
@@ -441,7 +448,14 @@ def write_outputs(
     _write_review(review_output_path, outcomes)
 
 
-def _write_result_rows(worksheet, outcomes: list[RowBatchOutcome]) -> None:
+def _write_result_rows(worksheet, outcomes: list[RowBatchOutcome], header_row: int) -> None:
+    explanation_header = worksheet.cell(row=header_row, column=RESULT_COLUMNS["说明"])
+    explanation_header.value = "说明"
+    source_header = worksheet.cell(row=header_row, column=16)
+    explanation_header.font = copy(source_header.font)
+    explanation_header.fill = copy(source_header.fill)
+    explanation_header.border = copy(source_header.border)
+    explanation_header.alignment = copy(source_header.alignment)
     outcome_map = {outcome.record.original_row_number: outcome for outcome in outcomes}
     for row_number in sorted(outcome_map.keys(), reverse=True):
         outcome = outcome_map[row_number]
@@ -458,16 +472,31 @@ def _write_result_rows(worksheet, outcomes: list[RowBatchOutcome]) -> None:
             for offset, item in enumerate(items[1:], start=1):
                 _write_item(worksheet, row_number + offset, item)
         else:
-            for col in range(12, 17):
-                worksheet.cell(row=row_number, column=col).value = None
+            _write_empty_outcome(worksheet, row_number, outcome)
 
 
 def _write_item(worksheet, row_number: int, item: NormalizedItem) -> None:
-    worksheet.cell(row=row_number, column=12).value = item.enterprise_name
-    worksheet.cell(row=row_number, column=13).value = item.tax_types_text
-    worksheet.cell(row=row_number, column=14).value = item.periods_text
-    worksheet.cell(row=row_number, column=15).value = item.amounts_text
-    worksheet.cell(row=row_number, column=16).value = item.overdue_text
+    worksheet.cell(row=row_number, column=12).value = item.enterprise_name or UNKNOWN_ENTERPRISE
+    worksheet.cell(row=row_number, column=13).value = item.tax_types_text or UNKNOWN_TAX
+    worksheet.cell(row=row_number, column=14).value = item.periods_text or UNKNOWN_PERIOD
+    worksheet.cell(row=row_number, column=15).value = item.amounts_text or UNKNOWN_AMOUNT
+    worksheet.cell(row=row_number, column=16).value = item.overdue_text or UNKNOWN_OVERDUE
+    worksheet.cell(row=row_number, column=17).value = item.explanation
+
+
+def _write_empty_outcome(worksheet, row_number: int, outcome: RowBatchOutcome) -> None:
+    values = [UNKNOWN_ENTERPRISE, UNKNOWN_TAX, UNKNOWN_PERIOD, UNKNOWN_AMOUNT, UNKNOWN_OVERDUE]
+    for column, value in enumerate(values, start=12):
+        worksheet.cell(row=row_number, column=column).value = value
+    explanations = {
+        "skipped_no_text": "三列均无可分析文本",
+        "input_too_long": "文本过长，模型未处理",
+        "api_error": "模型调用失败，等待重试",
+        "validation_error": "模型响应无法解析，等待重试",
+    }
+    worksheet.cell(row=row_number, column=17).value = explanations.get(
+        outcome.status, "未发现税款或申报逾期信息"
+    )
 
 
 def _copy_row_style(worksheet, source_row: int, target_row: int) -> None:
@@ -485,7 +514,7 @@ def _copy_row_style(worksheet, source_row: int, target_row: int) -> None:
 
 
 def _update_ranges(worksheet) -> None:
-    ref = f"A1:{get_column_letter(len(EXPECTED_COLUMNS))}{worksheet.max_row}"
+    ref = f"A1:{get_column_letter(OUTPUT_COLUMN_COUNT)}{worksheet.max_row}"
     if worksheet.auto_filter and worksheet.auto_filter.ref:
         worksheet.auto_filter.ref = ref
     for table in worksheet.tables.values():
@@ -538,10 +567,10 @@ def _write_review(path: Path, outcomes: list[RowBatchOutcome]) -> None:
             worksheet.append([outcome.record.original_row_number, outcome.record.sequence_number, outcome.record.business_id, issue, outcome.error_message_sanitized, "否", outcome.structured_result_path and str(outcome.structured_result_path), "人工处理或重试"])
         if outcome.status == "skipped_no_text":
             worksheet.append([outcome.record.original_row_number, outcome.record.sequence_number, outcome.record.business_id, "no_extractable_information", "三列均无可分析文本", "否", outcome.structured_result_path and str(outcome.structured_result_path), "无需调用模型"])
-        if outcome.status == "needs_review" and outcome.extraction_result is not None and not outcome.extraction_result.has_relevant_information:
-            worksheet.append([outcome.record.original_row_number, outcome.record.sequence_number, outcome.record.business_id, "no_extractable_information", "模型未提取到目标信息", "是", outcome.structured_result_path and str(outcome.structured_result_path), "人工复核"])
+        if outcome.status == "conflict":
+            worksheet.append([outcome.record.original_row_number, outcome.record.sequence_number, outcome.record.business_id, "clear_enterprise_conflict", "答复内容与其他来源的企业名称明确不一致", "是", outcome.structured_result_path and str(outcome.structured_result_path), "人工确认企业名称"])
         for item in outcome.normalized_items:
-            for reason in item.review_reasons:
+            for reason in item.review_reasons if item.needs_review else []:
                 worksheet.append([outcome.record.original_row_number, outcome.record.sequence_number, outcome.record.business_id, reason, reason, "是", outcome.structured_result_path and str(outcome.structured_result_path), "人工复核"])
     workbook.save(path)
     workbook.close()
@@ -553,7 +582,9 @@ def _validate_output_workbook(input_path: Path, output_path: Path, sheet_name: s
     try:
         source_sheet = source[sheet_name]
         output_sheet = output[sheet_name]
-        validate_header(output_sheet, header_row)
+        output_header = tuple(output_sheet.cell(row=header_row, column=column).value for column in range(1, 17))
+        if output_header != EXPECTED_COLUMNS or output_sheet.cell(row=header_row, column=17).value != "说明":
+            raise ExtractionError("输出表头不正确")
         expected_extra = sum(max(0, len(outcome.normalized_items) - 1) for outcome in outcomes)
         if output_sheet.max_row != source_sheet.max_row + expected_extra:
             raise ExtractionError("输出数据行数与拆行结果不一致")
@@ -580,8 +611,8 @@ def _validate_output_workbook(input_path: Path, output_path: Path, sheet_name: s
                 for tax_type in str(tax_value).split("；"):
                     if tax_type not in EXPECTED_TAX_TYPES:
                         raise ExtractionError("输出税种不在规范列表中")
-            if overdue_value not in {None, "已逾期"}:
-                raise ExtractionError("逾期列只能为空或已逾期")
+            if overdue_value not in {None, "已逾期", "未逾期", "未明确"}:
+                raise ExtractionError("逾期列只能是已逾期、未逾期或未明确")
     finally:
         source.close()
         output.close()

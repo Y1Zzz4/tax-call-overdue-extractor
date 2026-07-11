@@ -86,6 +86,7 @@ class NormalizedItem:
     periods_text: str | None
     amounts_text: str | None
     overdue_text: str | None
+    explanation: str
     needs_review: bool
     review_reasons: list[str] = field(default_factory=list)
     conflicts: list[Conflict] = field(default_factory=list)

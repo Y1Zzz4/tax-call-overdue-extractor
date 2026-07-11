@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Iterable
 
 from .batch_models import NormalizedItem, NormalizedPeriod, ReferenceMonth
-from .schemas import Conflict, ConflictClaim, ExtractionItem, ExtractionResult, PeriodMention, STANDARD_TAX_TYPES
+from .schemas import Conflict, ExtractionItem, ExtractionResult, PeriodMention, STANDARD_TAX_TYPES
 
 
 PRONOUN_ENTERPRISE_NAMES = {"我们公司", "我司", "本公司", "我们单位", "我公司", "本单位"}
@@ -39,25 +39,38 @@ def normalize_item(
 ) -> NormalizedItem:
     enterprise_name = _normalize_enterprise_name(item.enterprise_name)
     tax_types = _dedupe([tax_type for tax_type in item.tax_types if tax_type in STANDARD_TAX_TYPES])
-    periods, period_reviews = _normalize_periods(item.periods, reference_month)
-    amounts, amount_reviews = _normalize_amounts(item)
+    periods, period_notes = _normalize_periods(item.periods, reference_month)
+    amounts, amount_notes = _normalize_amounts(item)
     conflicts = list(model_conflicts or [])
-    overdue_text, overdue_reviews, overdue_conflicts = _determine_overdue(
+    overdue_text, overdue_notes, overdue_conflicts = _determine_overdue(
         explicitly_overdue=item.explicitly_overdue,
         periods=periods,
         reference_month=reference_month,
     )
     conflicts.extend(overdue_conflicts)
 
-    review_reasons = _dedupe(
+    notes = _dedupe(
         [
             *item.review_reasons,
-            *period_reviews,
-            *amount_reviews,
-            *overdue_reviews,
+            *period_notes,
+            *amount_notes,
+            *overdue_notes,
         ]
     )
-    needs_review = item.needs_review or bool(review_reasons) or bool(conflicts)
+    needs_review = item.needs_review or bool(conflicts)
+    missing = []
+    if enterprise_name is None:
+        missing.append("企业名称")
+    if not tax_types:
+        missing.append("税种")
+    if not periods:
+        missing.append("所属期")
+    if not amounts:
+        missing.append("金额")
+    explanation_parts = [item.relationship_note or ""]
+    if missing:
+        explanation_parts.append(f"未识别/未提及：{'、'.join(missing)}")
+    explanation_parts.extend(notes)
 
     return NormalizedItem(
         enterprise_name=enterprise_name,
@@ -65,8 +78,9 @@ def normalize_item(
         periods_text=_join_or_none(_dedupe([period.text for period in periods])),
         amounts_text=_join_or_none(amounts),
         overdue_text=overdue_text,
+        explanation=CHINESE_SEMICOLON.join(_dedupe([part for part in explanation_parts if part])) or "已完成提取",
         needs_review=needs_review,
-        review_reasons=review_reasons,
+        review_reasons=notes,
         conflicts=conflicts,
     )
 
@@ -219,9 +233,6 @@ def _normalize_amounts(item: ExtractionItem) -> tuple[list[str], list[str]]:
     amounts: list[str] = []
     reviews: list[str] = []
     for amount in item.amounts:
-        if amount.role == "unknown":
-            reviews.append("uncertain_amount")
-            continue
         amounts.append(amount.raw_text)
     return _dedupe(amounts), _dedupe(reviews)
 
@@ -237,17 +248,10 @@ def _determine_overdue(
     period_status = _period_overdue_status(periods, reference_month)
 
     if explicitly_overdue is True:
-        if period_status == "not_overdue":
-            conflicts.append(_local_overdue_conflict("原文明确逾期，但所属期规则未判定为逾期"))
-            reviews.append("conflicting_status")
-            return None, reviews, conflicts
         return "已逾期", reviews, conflicts
 
     if explicitly_overdue is False:
-        if period_status == "overdue":
-            conflicts.append(_local_overdue_conflict("原文明确未逾期或尚未到期，但所属期规则判定为已逾期"))
-            reviews.append("conflicting_status")
-        return None, reviews, conflicts
+        return "未逾期", reviews, conflicts
 
     if period_status == "overdue":
         return "已逾期", reviews, conflicts
@@ -281,17 +285,6 @@ def _period_overdue_status(periods: list[NormalizedPeriod], reference_month: Ref
     if "overdue" in statuses and any(status in {"current_or_cross", "future"} for status in statuses):
         return "mixed"
     return "not_overdue"
-
-
-def _local_overdue_conflict(description: str) -> Conflict:
-    return Conflict(
-        field="overdue",
-        description=description,
-        claims=[
-            ConflictClaim(source="业务内容", value="文本状态", quote="文本状态"),
-            ConflictClaim(source="答复内容", value="所属期规则", quote="所属期规则"),
-        ],
-    )
 
 
 def _period(start_year: int, start_month: int, end_year: int, end_month: int, granularity: str, raw_text: str) -> NormalizedPeriod:

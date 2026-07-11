@@ -15,9 +15,9 @@ MODEL_VOICE_TEXT_KEY = "电话录音转文本内容"
 BUSINESS_CONTENT_KEY = "业务内容"
 REPLY_CONTENT_KEY = "答复内容"
 ALLOWED_MODEL_DATA_KEYS: tuple[str, str, str] = (
-    MODEL_VOICE_TEXT_KEY,
-    BUSINESS_CONTENT_KEY,
     REPLY_CONTENT_KEY,
+    BUSINESS_CONTENT_KEY,
+    MODEL_VOICE_TEXT_KEY,
 )
 EXCEL_TO_MODEL_KEY: Mapping[str, str] = {
     CALL_TEXT_COLUMN: MODEL_VOICE_TEXT_KEY,
@@ -92,7 +92,7 @@ def build_model_input_from_allowed_data(data: Mapping[str, object]) -> ModelInpu
     serialized = json.dumps(
         normalized,
         ensure_ascii=False,
-        sort_keys=True,
+        sort_keys=False,
         separators=(",", ":"),
     )
     summaries = tuple(
