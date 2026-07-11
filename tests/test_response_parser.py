@@ -8,6 +8,13 @@ from tax_call_overdue_extractor.exceptions import ResponseParseError
 from tax_call_overdue_extractor.extraction.parser import parse_extraction_response
 
 
+SOURCE_TEXTS = {
+    "电话录音转文本内容": "电话中提到甲测试企业，增值税税款已经逾期缴纳。共同证据",
+    "业务内容": "业务记录中的甲测试企业。共同证据",
+    "答复内容": "答复原文",
+}
+
+
 def minimal_result() -> dict:
     return {
         "schema_version": "1.0",
@@ -202,3 +209,136 @@ def test_validation_error_message_does_not_include_sensitive_input_value() -> No
     assert "敏感企业名称" not in message
     assert "敏感证据片段" not in message
     assert "input_value" not in message
+
+
+def test_string_evidence_is_converted_only_when_source_is_unique() -> None:
+    item = base_item()
+    item["enterprise_name"] = "甲测试企业"
+    item["enterprise_evidence"] = ["业务记录中的甲测试企业"]
+
+    result = parse_extraction_response(
+        json.dumps(relevant_result_with_item(item), ensure_ascii=False),
+        SOURCE_TEXTS,
+    )
+
+    evidence = result.items[0].enterprise_evidence[0]
+    assert evidence.source == "业务内容"
+    assert evidence.quote == "业务记录中的甲测试企业"
+    assert result.needs_review is False
+
+
+def test_unlocatable_or_ambiguous_evidence_is_removed_and_reviewed() -> None:
+    item = base_item()
+    item["enterprise_name"] = "甲测试企业"
+    item["enterprise_evidence"] = ["模型改写的企业名称", "共同证据"]
+
+    result = parse_extraction_response(
+        json.dumps(relevant_result_with_item(item), ensure_ascii=False),
+        SOURCE_TEXTS,
+    )
+
+    assert result.items[0].enterprise_evidence == []
+    assert result.items[0].needs_review is True
+    assert result.needs_review is True
+    assert any("无法在三个允许输入字段中唯一定位" in reason for reason in result.review_reasons)
+
+
+def test_evidence_object_with_wrong_source_is_removed_and_reviewed() -> None:
+    item = base_item()
+    item["enterprise_name"] = "甲测试企业"
+    item["enterprise_evidence"] = [
+        {"source": "答复内容", "quote": "业务记录中的甲测试企业"}
+    ]
+
+    result = parse_extraction_response(
+        json.dumps(relevant_result_with_item(item), ensure_ascii=False),
+        SOURCE_TEXTS,
+    )
+
+    assert result.items[0].enterprise_evidence == []
+    assert any("证据对象无法在指定输入字段" in reason for reason in result.review_reasons)
+
+
+def test_hypothetical_overdue_question_cannot_be_explicitly_overdue() -> None:
+    source_texts = {
+        "电话录音转文本内容": "如果以后税款会不会逾期？",
+        "业务内容": None,
+        "答复内容": None,
+    }
+    item = base_item()
+    item["tax_types"] = ["未识别"]
+    item["explicitly_overdue"] = True
+    item["overdue_evidence"] = ["如果以后税款会不会逾期"]
+
+    result = parse_extraction_response(
+        json.dumps(relevant_result_with_item(item), ensure_ascii=False),
+        source_texts,
+    )
+
+    assert result.items[0].explicitly_overdue is None
+    assert result.items[0].overdue_evidence == []
+    assert result.items[0].needs_review is True
+
+
+def test_row_2_refund_workflow_is_not_tax_overdue_or_tax_period() -> None:
+    source_texts = {
+        "电话录音转文本内容": (
+            "之前我们2月底就发起过流程。他没有审核的话会不会过期？"
+            "之前存在过逾期作废。现在的流程不会作废或者过期。"
+        ),
+        "业务内容": (
+            "来电人于2026年6月12日提交了企业退个税的申请，之前2026年2月发起过一次"
+            "企业退个税流程，由于老师没有及时审核导致该流程逾期作废。"
+        ),
+        "答复内容": "已反馈至个税处",
+    }
+    current = base_item()
+    current.update({
+        "enterprise_name": "重庆海尔家电销售有限公司上海分公司",
+        "enterprise_evidence": [],
+        "tax_types": ["个人所得税"],
+        "tax_type_raw": ["个税"],
+        "tax_evidence": ["企业退个税的申请"],
+        "periods": [{
+            "raw_text": "2026年6月12日",
+            "period_type": "unparsed",
+            "start_year": 2026,
+            "start_month": 6,
+            "end_year": 2026,
+            "end_month": 6,
+            "relative_expression": None,
+            "evidence": ["2026年6月12日提交了企业退个税的申请"],
+        }],
+        "explicitly_overdue": False,
+        "overdue_evidence": ["他没有审核的话会不会过期"],
+        "relationship_note": "当前退税申请审核流程",
+    })
+    history = base_item()
+    history.update({
+        "enterprise_name": current["enterprise_name"],
+        "enterprise_evidence": [],
+        "tax_types": ["个人所得税"],
+        "tax_type_raw": ["个税"],
+        "tax_evidence": ["企业退个税流程"],
+        "periods": [{
+            "raw_text": "2026年2月",
+            "period_type": "single_month",
+            "start_year": 2026,
+            "start_month": 2,
+            "end_year": 2026,
+            "end_month": 2,
+            "relative_expression": None,
+            "evidence": ["之前2026年2月发起过一次企业退个税流程"],
+        }],
+        "explicitly_overdue": True,
+        "overdue_evidence": ["老师没有及时审核导致该流程逾期作废"],
+        "relationship_note": "以前退税申请审核流程逾期作废",
+    })
+    payload = relevant_result_with_item(current)
+    payload["items"] = [current, history]
+
+    result = parse_extraction_response(json.dumps(payload, ensure_ascii=False), source_texts)
+
+    assert result.has_relevant_information is False
+    assert result.items == []
+    assert all("2026年2月" not in period.raw_text for item in result.items for period in item.periods)

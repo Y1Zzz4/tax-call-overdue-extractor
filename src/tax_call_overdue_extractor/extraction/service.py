@@ -175,7 +175,7 @@ class SingleRecordExtractionService:
         client = self._llm_client or OpenAICompatibleLLMClient(self._settings.llm)
         response = client.complete(request)
         raw_response_path = _save_raw_response(self._settings.paths.state_dir, row_number, response.content)
-        result = parse_extraction_response(response.content)
+        result = parse_extraction_response(response.content, dict(model_input.data))
         _write_run_output(
             destination,
             status="success",

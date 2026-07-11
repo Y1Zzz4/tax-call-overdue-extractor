@@ -113,7 +113,7 @@ def extraction_json(
         "enterprise_evidence": ([{"source": "业务内容", "quote": enterprise}] if enterprise else []),
         "tax_types": tax_types or [],
         "tax_type_raw": tax_types or [],
-        "tax_evidence": ([{"source": "业务内容", "quote": "税种"}] if tax_types else []),
+        "tax_evidence": ([{"source": "业务内容", "quote": tax_types[0]}] if tax_types else []),
         "periods": periods or [],
         "amounts": amounts or [],
         "explicitly_overdue": explicitly_overdue,

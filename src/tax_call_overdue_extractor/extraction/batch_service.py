@@ -287,6 +287,7 @@ class BatchExtractionService:
                 schema_version=SCHEMA_VERSION,
                 model_name=self._settings.llm.model,
             )
+            raw_path: Path | None = None
             try:
                 request = build_chat_request(self._system_prompt or load_system_prompt(), record.model_input)
                 if self._llm_client is not None:
@@ -294,7 +295,7 @@ class BatchExtractionService:
                 else:
                     response = await asyncio.to_thread(client.complete, request)
                 raw_path = _save_raw_response(self._settings.paths.state_dir, record.original_row_number, response.content)
-                result = parse_extraction_response(response.content)
+                result = parse_extraction_response(response.content, dict(record.model_input.data))
                 normalized = normalize_extraction_result(result, reference_month=record.reference_month)
                 status = _status_for_result(result, normalized)
                 structured_path = _save_structured_result(self._settings.paths.state_dir, record.original_row_number, result, status)
@@ -326,11 +327,11 @@ class BatchExtractionService:
                     status="validation_error",
                     attempts=attempts,
                     structured_result_path=None,
-                    raw_response_path=None,
+                    raw_response_path=raw_path,
                     error_type=exc.__class__.__name__,
                     error_message_sanitized=str(exc),
                 )
-                return RowBatchOutcome(record, "validation_error", None, [], None, None, exc.__class__.__name__, str(exc))
+                return RowBatchOutcome(record, "validation_error", None, [], None, raw_path, exc.__class__.__name__, str(exc))
             except LLMClientError as exc:
                 store.upsert(
                     source_file_fingerprint=source_fingerprint,
@@ -598,7 +599,7 @@ def _outcome_from_reusable(record: BatchRecord, reusable) -> RowBatchOutcome:
 
 def _status_for_result(result: ExtractionResult, normalized: list[NormalizedItem]) -> BatchStatus:
     if not result.has_relevant_information:
-        return "needs_review"
+        return "needs_review" if result.needs_review else "success"
     if any(item.conflicts for item in normalized) or result.conflicts:
         return "conflict"
     if result.needs_review or any(item.needs_review for item in normalized):

@@ -17,3 +17,10 @@ def test_prompt_defines_relevance_beyond_overdue_word() -> None:
     assert "periods 必须是 PeriodMention 对象数组" in prompt
     assert "每个 item 必须包含 needs_review" in prompt
     assert "不允许在 item 根级输出 evidence 字段" in prompt
+    assert "只能是 Evidence 对象数组" in prompt
+    assert '"source": "电话录音转文本内容"' in prompt
+    assert '"quote": "重庆海尔家电销售有限公司上海分公司"' in prompt
+    assert "严禁输出字符串 Evidence" in prompt
+    assert "退个税申请因未及时审核而逾期作废" in prompt
+    assert "2026年2月发起申请" in prompt
+    assert "不同企业，或不同税种、所属期、金额" in prompt

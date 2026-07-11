@@ -70,7 +70,11 @@ class StrictSchemaModel(BaseModel):
 
 
 class Evidence(StrictSchemaModel):
-    source: SourceName
+    source: Literal[
+        "电话录音转文本内容",
+        "业务内容",
+        "答复内容",
+    ]
     quote: str = Field(min_length=1, max_length=200)
 
     @field_validator("quote")
