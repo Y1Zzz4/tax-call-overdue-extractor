@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .normalization import normalize_enterprise_name_candidate
-from .parser import find_explicit_tax_types, find_high_confidence_enterprise, load_json_object
+from .parser import (
+    find_explicit_tax_types,
+    find_high_confidence_enterprise,
+    load_json_object,
+    social_security_is_incidental,
+)
 from .schemas import ExtractionResult
 from .schemas import STANDARD_TAX_TYPES
 
@@ -253,6 +258,10 @@ def _review_tax_types(data: Any, source_texts: Mapping[str, str | None]) -> list
     values.extend(find_explicit_tax_types(dict(source_texts)))
     normalized = [value if value in STANDARD_TAX_TYPES else "其他" for value in values if value]
     normalized = list(dict.fromkeys(normalized))
+    if social_security_is_incidental(dict(source_texts)):
+        normalized = [value for value in normalized if value != "社保费"]
+        if "其他" not in normalized:
+            normalized.append("其他")
     if len(normalized) > 1 and "未识别" in normalized:
         normalized.remove("未识别")
     return normalized

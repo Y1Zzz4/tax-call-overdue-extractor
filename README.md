@@ -120,18 +120,83 @@ data/state/runs/20260711_120000_ab12cd/
 python scripts/run.py pack
 ```
 
-上传 `dist/tax_extractor_server.zip` 和完整 Excel 到服务器。服务器只需：
+上传 `dist/tax_extractor_server.zip` 和完整 Excel 到服务器，例如都放到 `~/tax-job-upload/`。然后执行：
 
 ```bash
-unzip tax_extractor_server.zip -d tax-extractor
-cd tax-extractor
+mkdir -p ~/tax-job
+unzip ~/tax-job-upload/tax_extractor_server.zip -d ~/tax-job
+cp ~/tax-job-upload/full.xlsx ~/tax-job/full.xlsx
+cd ~/tax-job
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 cp .env.example .env
-# 编辑 .env，指向服务器本地模型
-python scripts/run.py all --input /path/to/full.xlsx --overwrite
+nano .env
 ```
+
+`.env` 至少确认以下配置；本地兼容接口不支持结构化输出时使用 `none`：
+
+```text
+LLM_BASE_URL=http://127.0.0.1:8000/v1
+LLM_API_KEY=本地接口要求的密钥；不校验时填任意非空值
+LLM_MODEL=服务器实际加载的模型名
+LLM_RESPONSE_FORMAT_MODE=none
+```
+
+先用一条记录验证模型和文件：
+
+```bash
+cd ~/tax-job
+source .venv/bin/activate
+python scripts/run.py one --input ~/tax-job/full.xlsx --row-number 2 --overwrite
+```
+
+### 推荐：使用 systemd 在后台跑完全量
+
+创建用户级服务文件 `~/.config/systemd/user/tax-extractor.service`：
+
+```ini
+[Unit]
+Description=Tax call overdue full extraction
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tax-job
+ExecStart=%h/tax-job/.venv/bin/python %h/tax-job/scripts/run.py all --input %h/tax-job/full.xlsx --overwrite
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+```
+
+启动服务：
+
+```bash
+mkdir -p ~/.config/systemd/user
+nano ~/.config/systemd/user/tax-extractor.service
+systemctl --user daemon-reload
+systemctl --user enable --now tax-extractor.service
+```
+
+如需退出 SSH、注销甚至服务器重启后继续运行，让管理员执行一次：
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+查看状态和实时日志：
+
+```bash
+systemctl --user status tax-extractor.service
+journalctl --user -u tax-extractor.service -f
+```
+
+程序自带 `--resume`，成功记录保存在 `data/state/batch_state.sqlite3`。进程中断后执行 `systemctl --user restart tax-extractor.service`，已成功记录会直接复用，只重试失败或未完成记录。不要删除 `data/state/`。
+
+完成后日志应出现 `api_error_count=0` 和 `validation_error_count=0`，并给出 `output_path`。若任一错误数不为 0，确认本地模型正常后重启同一服务；断点状态会避免重跑成功记录。最终 Excel 位于 `data/output/`，人工复核表也在该目录，冲突表位于 `data/conflicts/`。
 
 部署包只包含 `src/`、`config/`、`scripts/run.py`、`pyproject.toml`、README 和 `.env.example`，不会包含 `.env`、Excel、测试、raw、structured、SQLite 或历史输出。
 

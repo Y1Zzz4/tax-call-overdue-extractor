@@ -76,6 +76,7 @@ def preprocess_response_payload(
     if not isinstance(items, list):
         return normalized
     explicit_tax_types = find_explicit_tax_types(texts)
+    incidental_social_security = social_security_is_incidental(texts)
 
     kept_items: list[Any] = []
     top_notes = _reason_list(normalized.get("review_reasons"))
@@ -111,6 +112,15 @@ def preprocess_response_payload(
                 *_string_list(item.get("tax_types")),
                 *explicit_tax_types,
             ]))
+        if incidental_social_security:
+            item["tax_types"] = [
+                value for value in _string_list(item.get("tax_types")) if value != "社保费"
+            ]
+            item["tax_type_raw"] = [
+                value
+                for value in _string_list(item.get("tax_type_raw"))
+                if value not in {"社保", "社保费", "社会保险费"}
+            ]
             item["tax_type_raw"] = list(dict.fromkeys([
                 *_string_list(item.get("tax_type_raw")),
                 *explicit_tax_types,
@@ -253,7 +263,21 @@ def find_explicit_tax_types(source_texts: dict[str, str | None]) -> list[str]:
         for tax_type in STANDARD_TAX_TYPES
         if tax_type not in {"其他", "未识别"} and tax_type in text
     )
+    if social_security_is_incidental(source_texts):
+        found = [value for value in found if value != "社保费"]
+    if re.search(r"存款账户.{0,12}(?:逾期报告|报告逾期)|账户逾期报告", text):
+        found.append("其他")
     return list(dict.fromkeys(found))
+
+
+def social_security_is_incidental(source_texts: dict[str, str | None]) -> bool:
+    """账户报告事项中，“退社保/社保老师”等历史背景不视为当前社保费事项。"""
+
+    text = " ".join(source_texts.get(source) or "" for source in SOURCE_PRIORITY)
+    if not re.search(r"存款账户|账户逾期报告", text):
+        return False
+    without_background = re.sub(r"退社保(?:费)?|社保老师", "", text)
+    return "社保" not in without_background and "社会保险费" not in without_background
 
 
 def _enterprise_only_item(name: str, source: str, quote: str) -> dict[str, Any]:

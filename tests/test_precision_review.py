@@ -273,6 +273,35 @@ def test_month_range_suppresses_redundant_single_months() -> None:
     assert normalized.periods_text == "2024年1月至2024年2月"
 
 
+def test_account_report_does_not_become_social_security_from_background_phrase() -> None:
+    texts = {
+        "业务内容": "存款账户绑定时候提示账户逾期报告提醒",
+        "答复内容": "联系专管员确认",
+        "电话录音转文本内容": "因为有一个要退社保的东西，社保老师让我们把账户添加进去",
+    }
+    raw = json.dumps({
+        "items": [{
+            "enterprise_name": None,
+            "enterprise_evidence": [],
+            "tax_types": ["社保费"],
+            "tax_type_raw": ["社保"],
+            "tax_evidence": [],
+            "periods": [],
+            "amounts": [],
+            "explicitly_overdue": None,
+            "overdue_evidence": [],
+        }],
+    }, ensure_ascii=False)
+    first_pass = parse_extraction_response(raw, texts)
+    review = parse_precision_review(
+        '{"enterprises":[],"tax_types":["社保费"],"periods":[],"explicitly_overdue":null}',
+        texts,
+    )
+    result = apply_precision_review(first_pass, review, texts)
+
+    assert result.items[0].tax_types == ["其他"]
+
+
 def test_high_confidence_voice_confirmation_can_correct_incomplete_name() -> None:
     texts = {
         "业务内容": None,
