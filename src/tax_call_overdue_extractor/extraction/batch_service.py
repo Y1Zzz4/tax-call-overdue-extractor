@@ -624,7 +624,7 @@ def _validate_output_workbook(input_path: Path, output_path: Path, sheet_name: s
             for col in range(1, 12):
                 source_cell = source_sheet.cell(row=row, column=col)
                 output_cell = output_sheet.cell(row=row, column=col)
-                if source_cell.value != output_cell.value:
+                if not _same_original_cell_value(source_cell.value, output_cell.value):
                     raise ExtractionError("输出原始记录前11列发生变化")
                 if source_cell.data_type != output_cell.data_type:
                     raise ExtractionError("输出原始记录前11列数据类型发生变化")
@@ -644,6 +644,18 @@ def _validate_output_workbook(input_path: Path, output_path: Path, sheet_name: s
     finally:
         source.close()
         output.close()
+
+
+def _same_original_cell_value(source_value: object, output_value: object) -> bool:
+    """Excel 保存会把 CRLF/CR 规范成 LF；这种不可见换行差异不算内容变化。"""
+
+    if isinstance(source_value, str) and isinstance(output_value, str):
+        return _normalize_excel_newlines(source_value) == _normalize_excel_newlines(output_value)
+    return source_value == output_value
+
+
+def _normalize_excel_newlines(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _outcome_from_reusable(record: BatchRecord, reusable) -> RowBatchOutcome:

@@ -18,7 +18,11 @@ from tax_call_overdue_extractor.config import (
 )
 from tax_call_overdue_extractor.excel_io import EXPECTED_COLUMNS
 from tax_call_overdue_extractor.exceptions import ExtractionError, LLMClientError
-from tax_call_overdue_extractor.extraction.batch_service import BatchExtractionService, BatchOptions
+from tax_call_overdue_extractor.extraction.batch_service import (
+    BatchExtractionService,
+    BatchOptions,
+    _same_original_cell_value,
+)
 from tax_call_overdue_extractor.extraction.normalization import normalize_extraction_result, parse_reference_month
 from tax_call_overdue_extractor.extraction.parser import parse_extraction_response
 from tax_call_overdue_extractor.llm.client import LLMResponse
@@ -52,6 +56,12 @@ def make_settings(tmp_path: Path, *, max_input_chars: int = 12000) -> ProjectSet
             max_input_chars=max_input_chars,
         ),
     )
+
+
+def test_output_validation_treats_excel_newline_serialization_as_equal() -> None:
+    assert _same_original_cell_value("第一行\r\n第二行", "第一行\n第二行") is True
+    assert _same_original_cell_value("第一行\r第二行", "第一行\n第二行") is True
+    assert _same_original_cell_value("原内容", "修改内容") is False
 
 
 def create_batch_workbook(path: Path, rows: int, *, blank_rows: set[int] | None = None) -> None:
