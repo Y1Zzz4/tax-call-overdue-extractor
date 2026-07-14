@@ -79,6 +79,41 @@ class BatchStateStore:
             attempts=int(row["attempts"]),
         )
 
+    def latest_reusable_record(
+        self,
+        *,
+        worksheet: str,
+        original_row_number: int,
+        input_hash: str,
+    ) -> StateRecord | None:
+        """离线导出时复用同一行、同一三列输入的最新成功结果，不要求提示词版本一致。"""
+
+        placeholders = ", ".join("?" for _ in REUSABLE_STATUSES)
+        row = self._connection.execute(
+            f"""
+            SELECT * FROM batch_records
+            WHERE worksheet = ?
+              AND original_row_number = ?
+              AND input_hash = ?
+              AND status IN ({placeholders})
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (worksheet, original_row_number, input_hash, *sorted(REUSABLE_STATUSES)),
+        ).fetchone()
+        if row is None:
+            return None
+        structured_path = Path(row["structured_result_path"]) if row["structured_result_path"] else None
+        if row["status"] in {"success", "conflict", "needs_review", "skipped_no_text"}:
+            if structured_path is None or not structured_path.exists():
+                return None
+        return StateRecord(
+            status=row["status"],
+            structured_result_path=structured_path,
+            raw_response_path=Path(row["raw_response_path"]) if row["raw_response_path"] else None,
+            attempts=int(row["attempts"]),
+        )
+
     def mark_processing(
         self,
         *,

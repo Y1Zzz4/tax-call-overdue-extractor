@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--execute", action="store_true", help="实际调用模型；不传时只预检")
     batch_parser.add_argument("--overwrite", action="store_true", help="允许覆盖最终输出 Excel")
     batch_parser.add_argument("--allow-large-run", action="store_true", help="允许本次计划处理超过100条")
+    batch_parser.add_argument("--offline", action="store_true", help="只使用已有断点结果生成 Excel，绝不调用模型")
     batch_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="配置文件路径")
     batch_parser.add_argument("--log-level", help="日志等级，如 INFO、DEBUG、WARNING")
     batch_parser.set_defaults(handler=_handle_extract_batch)
@@ -173,6 +174,7 @@ def _handle_extract_batch(args: argparse.Namespace) -> int:
         execute=args.execute,
         overwrite=args.overwrite,
         allow_large_run=args.allow_large_run,
+        offline=args.offline,
     )
     if not args.execute:
         _print_batch_plan(service.preflight(options))

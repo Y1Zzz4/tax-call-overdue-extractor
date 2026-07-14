@@ -340,6 +340,34 @@ def test_resume_reprocesses_when_cached_result_file_is_missing(tmp_path: Path) -
     assert len(second.calls) == 2
 
 
+def test_offline_export_reuses_existing_result_across_prompt_versions(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    source = settings.paths.samples_dir / "sample.xlsx"
+    create_batch_workbook(source, 2)
+    first = RoutingClient()
+    BatchExtractionService(settings, llm_client=first, system_prompt="old-prompt").run(
+        BatchOptions(input_path=source, execute=True, overwrite=True, resume=True)
+    )
+    assert len(first.calls) == 4
+
+    offline_client = RoutingClient(mode="fail_one")
+    summary = BatchExtractionService(
+        settings,
+        llm_client=offline_client,
+        system_prompt="new-prompt",
+    ).run(BatchOptions(
+        input_path=source,
+        execute=True,
+        overwrite=True,
+        resume=True,
+        offline=True,
+    ))
+
+    assert len(offline_client.calls) == 0
+    assert summary.success_count == 2
+    assert summary.output_path.exists()
+
+
 def test_multi_items_are_merged_without_changing_original_rows(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     source = settings.paths.samples_dir / "sample.xlsx"

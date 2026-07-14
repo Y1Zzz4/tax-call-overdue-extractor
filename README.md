@@ -196,6 +196,14 @@ journalctl --user -u tax-extractor.service -f
 
 程序自带 `--resume`，成功记录保存在 `data/state/batch_state.sqlite3`。进程中断后执行 `systemctl --user restart tax-extractor.service`，已成功记录会直接复用，只重试失败或未完成记录。不要删除 `data/state/`。
 
+如果模型结果已经生成，只因最终 Excel 写出失败，可完全离线导出，不连接模型：
+
+```bash
+python scripts/run.py export --input full.xlsx --overwrite
+```
+
+`export` 会按同一工作表、Excel 行号和三列内容哈希复用 `data/state` 中最新成功结果；没有缓存的行会写入说明和 review 表，不会调用 API。
+
 完成后日志应出现 `api_error_count=0` 和 `validation_error_count=0`，并给出 `output_path`。若任一错误数不为 0，确认本地模型正常后重启同一服务；断点状态会避免重跑成功记录。最终 Excel 位于 `data/output/`，人工复核表也在该目录，冲突表位于 `data/conflicts/`。
 
 部署包只包含 `src/`、`config/`、`scripts/run.py`、`pyproject.toml`、README 和 `.env.example`，不会包含 `.env`、Excel、测试、raw、structured、SQLite 或历史输出。

@@ -70,6 +70,7 @@ class BatchOptions:
     execute: bool = False
     overwrite: bool = False
     allow_large_run: bool = False
+    offline: bool = False
 
 
 class BatchExtractionService:
@@ -182,6 +183,7 @@ class BatchExtractionService:
                     prompt_hash=prompt_hash,
                     resume=options.resume,
                     run_id=run_id,
+                    offline=options.offline,
                 )
             )
         finally:
@@ -210,6 +212,7 @@ class BatchExtractionService:
         prompt_hash: str,
         resume: bool,
         run_id: str,
+        offline: bool,
     ) -> list[RowBatchOutcome]:
         semaphore = asyncio.Semaphore(plan.concurrency)
         tasks = [
@@ -222,6 +225,7 @@ class BatchExtractionService:
                 prompt_hash=prompt_hash,
                 resume=resume,
                 run_id=run_id,
+                offline=offline,
                 semaphore=semaphore,
             )
             for record in records
@@ -240,6 +244,7 @@ class BatchExtractionService:
         prompt_hash: str,
         resume: bool,
         run_id: str,
+        offline: bool,
         semaphore: asyncio.Semaphore,
     ) -> RowBatchOutcome:
         reusable = None
@@ -255,6 +260,25 @@ class BatchExtractionService:
             )
         if reusable is not None:
             return _outcome_from_reusable(record, reusable)
+
+        if offline:
+            reusable = store.latest_reusable_record(
+                worksheet=plan.sheet_name,
+                original_row_number=record.original_row_number,
+                input_hash=record.input_hash,
+            )
+            if reusable is not None:
+                return _outcome_from_reusable(record, reusable)
+            return RowBatchOutcome(
+                record,
+                "api_error",
+                None,
+                [],
+                None,
+                None,
+                "offline_cache_miss",
+                "没有找到同一行、同一三列输入的已有结果",
+            )
 
         if not record.model_input.has_any_text:
             result = no_text_result()

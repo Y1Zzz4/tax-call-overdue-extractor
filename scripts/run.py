@@ -19,6 +19,7 @@ COMMANDS = {
     "check": ["extract-batch", "--execute", "--resume"],
     "one": ["extract-one"],
     "all": ["extract-batch", "--execute", "--resume", "--allow-large-run"],
+    "export": ["extract-batch", "--execute", "--resume", "--allow-large-run", "--offline"],
 }
 
 
@@ -26,16 +27,17 @@ def run(argv: list[str]) -> int:
     if argv and argv[0] == "pack":
         return pack_server_bundle()
     if not argv or argv[0] not in COMMANDS:
-        print("用法: python scripts/run.py {sample|check|one|all|pack} [参数]")
+        print("用法: python scripts/run.py {sample|check|one|all|export|pack} [参数]")
         print("  sample  从 data/input 抽样 50 条")
         print("  check   用模型处理 data/samples 中的 50 条样本")
         print("  one     调试样本中的单条记录")
         print("  all     在服务器用本地模型处理 --input 指定的完整 Excel")
+        print("  export  不调用模型，直接用 data/state 中已有结果生成 Excel")
         print("  pack    生成可直接上传服务器的最小 zip 包")
         return 2 if argv else 0
     command, *rest = argv
-    if command == "all" and "--input" not in rest:
-        print("all 必须显式提供完整 Excel：--input /path/to/full.xlsx")
+    if command in {"all", "export"} and "--input" not in rest:
+        print(f"{command} 必须显式提供完整 Excel：--input /path/to/full.xlsx")
         return 2
     return main([*COMMANDS[command], *rest])
 
